@@ -65,48 +65,61 @@ public static class Webmail
             }
 
             context.Items[PdnUserKey] = user;
+
+            // The public mount point (e.g. "/apps/bbs") when proxied through the gateway;
+            // absent (→ "") on direct loopback access. Every absolute URL we render or
+            // redirect to must carry it, or the browser escapes to pdn's root.
+            context.Items[PrefixKey] = context.Request.Headers["X-Forwarded-Prefix"].ToString().TrimEnd('/');
+
             await next().ConfigureAwait(false);
         });
 
         app.MapGet("/", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
-            (user, call) => Inbox(options, call, page ?? 1)));
+            (prefix, call) => Inbox(options, prefix, call, page ?? 1)));
 
         app.MapGet("/bulletins", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
-            (user, call) => Bulletins(options, call, page ?? 1)));
+            (prefix, call) => Bulletins(options, prefix, call, page ?? 1)));
 
         app.MapGet("/messages/{number:long}", (HttpContext ctx, long number) => WithCallsign(ctx, options,
-            (user, call) => ReadMessage(options, call, number)));
+            (prefix, call) => ReadMessage(options, prefix, call, number)));
 
         app.MapGet("/compose", (HttpContext ctx, string? to, string? type) => WithCallsign(ctx, options,
-            (user, call) => ComposeForm(options, call, to, type)));
+            (prefix, call) => ComposeForm(options, prefix, call, to, type)));
 
         app.MapPost("/compose", async (HttpContext ctx) =>
         {
             string user = PdnUser(ctx);
+            string prefix = Prefix(ctx);
             string? call = FindCallsign(options.Store, user);
             if (call is null)
             {
-                return Results.Redirect("/");
+                return Results.Redirect(U(prefix, "/"));
             }
 
             IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
-            return Compose(options, call, form);
+            return Compose(options, prefix, call, form);
         });
 
         app.MapPost("/messages/{number:long}/kill", (HttpContext ctx, long number) => WithCallsign(ctx, options,
-            (user, call) => Kill(options, call, number)));
+            (prefix, call) => Kill(options, prefix, call, number)));
 
         app.MapPost("/claim", async (HttpContext ctx) =>
         {
             string user = PdnUser(ctx);
             IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
-            return Claim(options, user, form["callsign"].ToString());
+            return Claim(options, Prefix(ctx), user, form["callsign"].ToString());
         });
     }
 
     private const string PdnUserKey = "pdnUser";
+    private const string PrefixKey = "pdnPrefix";
 
     private static string PdnUser(HttpContext ctx) => (string)ctx.Items[PdnUserKey]!;
+
+    private static string Prefix(HttpContext ctx) => (string)ctx.Items[PrefixKey]!;
+
+    /// <summary>Roots an absolute path under the gateway mount prefix ("" when direct).</summary>
+    private static string U(string prefix, string path) => prefix + path;
 
     /// <summary>The pdn-username → callsign mapping (case-insensitive over the user table).</summary>
     internal static string? FindCallsign(BbsStore store, string pdnUser)
@@ -125,39 +138,40 @@ public static class Webmail
     private static IResult WithCallsign(HttpContext ctx, WebmailOptions options, Func<string, string, IResult> handler)
     {
         string user = PdnUser(ctx);
+        string prefix = Prefix(ctx);
         string? call = FindCallsign(options.Store, user);
-        return call is null ? ClaimForm(user, error: null) : handler(user, call);
+        return call is null ? ClaimForm(prefix, user, error: null) : handler(prefix, call);
     }
 
     // ---------------------------------------------------------------- pages
 
-    private static IResult Inbox(WebmailOptions o, string call, int page)
+    private static IResult Inbox(WebmailOptions o, string prefix, string call, int page)
     {
         IReadOnlyList<Message> mine = o.Store.ListMessages(new MessageQuery
         {
             Type = MessageType.Personal,
             ToCall = call,
         });
-        string rows = MessageRows(mine, page, o.PageSize, call, "/");
-        return Html(Page(o, call, "Inbox",
+        string rows = MessageRows(mine, page, o.PageSize, call, prefix, "/");
+        return Html(Page(o, prefix, call, "Inbox",
             $"""
             <h2>Inbox — personal messages for {H(call)}</h2>
             {rows}
             """));
     }
 
-    private static IResult Bulletins(WebmailOptions o, string call, int page)
+    private static IResult Bulletins(WebmailOptions o, string prefix, string call, int page)
     {
         IReadOnlyList<Message> bulls = o.Store.ListMessages(new MessageQuery { Type = MessageType.Bulletin });
-        string rows = MessageRows(bulls, page, o.PageSize, call, "/bulletins");
-        return Html(Page(o, call, "Bulletins",
+        string rows = MessageRows(bulls, page, o.PageSize, call, prefix, "/bulletins");
+        return Html(Page(o, prefix, call, "Bulletins",
             $"""
             <h2>Bulletins</h2>
             {rows}
             """));
     }
 
-    private static IResult ReadMessage(WebmailOptions o, string call, long number)
+    private static IResult ReadMessage(WebmailOptions o, string prefix, string call, long number)
     {
         Message? message = o.Store.GetMessage(number);
         bool isSysop = IsSysop(o, call);
@@ -171,10 +185,10 @@ public static class Webmail
 
         bool canKill = MessageRules.CanKill(message, call, isSysop);
         string killForm = canKill && message.Status != MessageStatus.Killed
-            ? $"""<form method="post" action="/messages/{message.Number}/kill"><button type="submit">Kill message</button></form>"""
+            ? $"""<form method="post" action="{U(prefix, Inv($"/messages/{message.Number}/kill"))}"><button type="submit">Kill message</button></form>"""
             : "";
         string to = string.Join("; ", message.Recipients.Select(r => r.ToCall));
-        return Html(Page(o, call, Inv($"Message {message.Number}"),
+        return Html(Page(o, prefix, call, Inv($"Message {message.Number}"),
             $"""
             <h2>Message {message.Number} <span class="dim">[{H(message.Type.ToCode().ToString())}/{H(message.Status.ToCode().ToString())}]</span></h2>
             <table class="meta">
@@ -189,13 +203,13 @@ public static class Webmail
             """));
     }
 
-    private static IResult ComposeForm(WebmailOptions o, string call, string? to, string? type)
+    private static IResult ComposeForm(WebmailOptions o, string prefix, string call, string? to, string? type)
     {
         bool bulletin = string.Equals(type, "B", StringComparison.OrdinalIgnoreCase);
-        return Html(Page(o, call, "Compose",
+        return Html(Page(o, prefix, call, "Compose",
             $"""
             <h2>Compose</h2>
-            <form method="post" action="/compose">
+            <form method="post" action="{U(prefix, "/compose")}">
             <p><label>Type
             <select name="type">
             <option value="P"{(bulletin ? "" : " selected")}>Personal</option>
@@ -210,7 +224,7 @@ public static class Webmail
             """));
     }
 
-    private static IResult Compose(WebmailOptions o, string call, IFormCollection form)
+    private static IResult Compose(WebmailOptions o, string prefix, string call, IFormCollection form)
     {
         string typeField = form["type"].ToString().Trim().ToUpperInvariant();
         MessageType type = typeField == "B" ? MessageType.Bulletin : MessageType.Personal;
@@ -221,8 +235,8 @@ public static class Webmail
 
         if (to.Length == 0 || subject.Length == 0)
         {
-            return Html(Page(o, call, "Compose",
-                """<h2>Compose</h2><p class="err">TO and Subject are required.</p><p><a href="/compose">Back</a></p>"""),
+            return Html(Page(o, prefix, call, "Compose",
+                $"""<h2>Compose</h2><p class="err">TO and Subject are required.</p><p><a href="{U(prefix, "/compose")}">Back</a></p>"""),
                 StatusCodes.Status400BadRequest);
         }
 
@@ -237,8 +251,8 @@ public static class Webmail
         string[] recipients = to.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (recipients.Length == 0)
         {
-            return Html(Page(o, call, "Compose",
-                """<h2>Compose</h2><p class="err">TO is required.</p><p><a href="/compose">Back</a></p>"""),
+            return Html(Page(o, prefix, call, "Compose",
+                $"""<h2>Compose</h2><p class="err">TO is required.</p><p><a href="{U(prefix, "/compose")}">Back</a></p>"""),
                 StatusCodes.Status400BadRequest);
         }
 
@@ -259,10 +273,10 @@ public static class Webmail
             Body = Encoding.Latin1.GetBytes(crBody),
         });
         o.Routing.RouteMessage(stored);
-        return Results.Redirect(Inv($"/messages/{stored.Number}"));
+        return Results.Redirect(U(prefix, Inv($"/messages/{stored.Number}")));
     }
 
-    private static IResult Kill(WebmailOptions o, string call, long number)
+    private static IResult Kill(WebmailOptions o, string prefix, string call, long number)
     {
         Message? message = o.Store.GetMessage(number);
         if (message is null || !MessageRules.CanKill(message, call, IsSysop(o, call)))
@@ -271,30 +285,30 @@ public static class Webmail
         }
 
         o.Store.Kill(number);
-        return Results.Redirect("/");
+        return Results.Redirect(U(prefix, "/"));
     }
 
-    private static IResult Claim(WebmailOptions o, string pdnUser, string callsignInput)
+    private static IResult Claim(WebmailOptions o, string prefix, string pdnUser, string callsignInput)
     {
         string call = Callsigns.NormalizeAddressee(callsignInput);
         if (call.Length < 3 || !call.All(char.IsAsciiLetterOrDigit) || !call.Any(char.IsAsciiDigit))
         {
-            return ClaimForm(pdnUser, "That doesn't look like a callsign.", StatusCodes.Status400BadRequest);
+            return ClaimForm(prefix, pdnUser, "That doesn't look like a callsign.", StatusCodes.Status400BadRequest);
         }
 
         User? existing = o.Store.GetUser(call);
         if (existing?.PdnUsername is { Length: > 0 } owner
             && !string.Equals(owner, pdnUser, StringComparison.OrdinalIgnoreCase))
         {
-            return ClaimForm(pdnUser, Inv($"{call} is already linked to another pdn account."), StatusCodes.Status409Conflict);
+            return ClaimForm(prefix, pdnUser, Inv($"{call} is already linked to another pdn account."), StatusCodes.Status409Conflict);
         }
 
         User user = (existing ?? new User { Callsign = call }) with { PdnUsername = pdnUser };
         o.Store.UpsertUser(user);
-        return Results.Redirect("/");
+        return Results.Redirect(U(prefix, "/"));
     }
 
-    private static IResult ClaimForm(string pdnUser, string? error, int status = StatusCodes.Status200OK)
+    private static IResult ClaimForm(string prefix, string pdnUser, string? error, int status = StatusCodes.Status200OK)
     {
         string err = error is null ? "" : $"""<p class="err">{H(error)}</p>""";
         return Html($$"""
@@ -304,7 +318,7 @@ public static class Webmail
             <h1>pdn-bbs</h1>
             <p>Hello <b>{{H(pdnUser)}}</b>. This pdn account isn't linked to a callsign yet.</p>
             {{err}}
-            <form method="post" action="/claim">
+            <form method="post" action="{{U(prefix, "/claim")}}">
             <p><label>Your callsign <input name="callsign" maxlength="9" required></label>
             <button type="submit">Claim</button></p>
             </form>
@@ -317,7 +331,7 @@ public static class Webmail
     private static bool IsSysop(WebmailOptions o, string call) =>
         o.SysopCallsign.Length > 0 && Callsigns.BaseEquals(o.SysopCallsign, call);
 
-    private static string MessageRows(IReadOnlyList<Message> messages, int page, int pageSize, string call, string basePath)
+    private static string MessageRows(IReadOnlyList<Message> messages, int page, int pageSize, string call, string prefix, string basePath)
     {
         page = Math.Max(1, page);
         var slice = messages.Skip((page - 1) * pageSize).Take(pageSize).ToList();
@@ -332,7 +346,7 @@ public static class Webmail
         {
             bool unreadByMe = m.Recipients.Any(r =>
                 Callsigns.BaseEquals(r.ToCall, call) && r.ReadAt is null);
-            string subject = Inv($"""<a href="/messages/{m.Number}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
+            string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}"))}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
             sb.Append(Inv($"<tr{(unreadByMe ? " class=\"unread\"" : "")}><td>{m.Number}</td>"))
               .Append(Inv($"<td>{H(m.Status.ToCode().ToString())}</td><td>{H(m.From)}</td>"))
               .Append(Inv($"<td>{H(string.Join(";", m.Recipients.Select(r => r.ToCall)))}{(m.At is null ? "" : "@" + H(m.At))}</td>"))
@@ -342,24 +356,24 @@ public static class Webmail
         sb.Append("</table><p class=\"pager\">");
         if (page > 1)
         {
-            sb.Append(Inv($"""<a href="{basePath}?page={page - 1}">&laquo; newer</a> """));
+            sb.Append(Inv($"""<a href="{U(prefix, basePath)}?page={page - 1}">&laquo; newer</a> """));
         }
 
         if (messages.Count > page * pageSize)
         {
-            sb.Append(Inv($"""<a href="{basePath}?page={page + 1}">older &raquo;</a>"""));
+            sb.Append(Inv($"""<a href="{U(prefix, basePath)}?page={page + 1}">older &raquo;</a>"""));
         }
 
         sb.Append("</p>");
         return sb.ToString();
     }
 
-    private static string Page(WebmailOptions o, string call, string title, string body) => $$"""
+    private static string Page(WebmailOptions o, string prefix, string call, string title, string body) => $$"""
         <!doctype html>
         <html><head><meta charset="utf-8"><title>{{H(o.BbsCallsign)}} — {{H(title)}}</title>{{Style}}</head>
         <body><main>
         <h1>{{H(o.BbsCallsign)}} <span class="dim">webmail</span></h1>
-        <nav><a href="/">Inbox</a> · <a href="/bulletins">Bulletins</a> · <a href="/compose">Compose</a>
+        <nav><a href="{{U(prefix, "/")}}">Inbox</a> · <a href="{{U(prefix, "/bulletins")}}">Bulletins</a> · <a href="{{U(prefix, "/compose")}}">Compose</a>
         <span class="dim">— de {{H(call)}}</span></nav>
         {{body}}
         </main></body></html>

@@ -38,7 +38,8 @@ public sealed class WebmailTests : IAsyncDisposable
         _dir.Delete(recursive: true);
     }
 
-    private async Task<HttpClient> StartAsync(string pdnUser = "tom", bool gatewayHeader = true)
+    private async Task<HttpClient> StartAsync(
+        string pdnUser = "tom", bool gatewayHeader = true, string? forwardedPrefix = null, bool autoRedirect = true)
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -53,13 +54,19 @@ public sealed class WebmailTests : IAsyncDisposable
         });
         await _app.StartAsync();
 
-        var client = new HttpClient { BaseAddress = new Uri(_app.Urls.First()) };
+        var handler = new HttpClientHandler { AllowAutoRedirect = autoRedirect };
+        var client = new HttpClient(handler) { BaseAddress = new Uri(_app.Urls.First()) };
         if (gatewayHeader)
         {
             client.DefaultRequestHeaders.Add("X-Pdn-Gateway", "1");
         }
 
         client.DefaultRequestHeaders.Add("X-Pdn-User", pdnUser);
+        if (forwardedPrefix is not null)
+        {
+            client.DefaultRequestHeaders.Add("X-Forwarded-Prefix", forwardedPrefix);
+        }
+
         return client;
     }
 
@@ -277,5 +284,109 @@ public sealed class WebmailTests : IAsyncDisposable
         string page2 = await client.GetStringAsync(new Uri("/bulletins?page=2", UriKind.Relative));
         Assert.Contains("href=\"/messages/5\"", page2, StringComparison.Ordinal);
         Assert.DoesNotContain("href=\"/messages/30\"", page2, StringComparison.Ordinal);
+    }
+
+    // ------------------------------------------------ X-Forwarded-Prefix (gateway mount)
+    // Behind pdn's app gateway the app is mounted at /apps/bbs/ with the prefix stripped on
+    // proxying; pdn injects X-Forwarded-Prefix and every absolute URL we render or redirect
+    // to must carry it (packet.net docs/app-gateway.md). Without the header (the tests
+    // above), URLs stay root-relative.
+
+    [Fact]
+    public async Task ForwardedPrefix_ClaimFormAction_CarriesThePrefix()
+    {
+        using HttpClient client = await StartAsync(forwardedPrefix: "/apps/bbs");
+
+        string page = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+        Assert.Contains("action=\"/apps/bbs/claim\"", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ForwardedPrefix_SuccessfulClaim_RedirectsUnderThePrefix()
+    {
+        using HttpClient client = await StartAsync(forwardedPrefix: "/apps/bbs", autoRedirect: false);
+
+        HttpResponseMessage claim = await client.PostAsync(
+            new Uri("/claim", UriKind.Relative),
+            new FormUrlEncodedContent([new KeyValuePair<string, string>("callsign", "m0lte")]));
+        Assert.Equal(HttpStatusCode.Found, claim.StatusCode);
+        Assert.Equal("/apps/bbs/", claim.Headers.Location!.OriginalString);
+        Assert.Equal("tom", _store.GetUser("M0LTE")!.PdnUsername);
+    }
+
+    [Fact]
+    public async Task ForwardedPrefix_InboxNavRowAndPagerLinks_CarryThePrefix()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        for (int i = 1; i <= 30; i++)
+        {
+            _store.AddMessage(new MessageDraft
+            {
+                Type = MessageType.Personal,
+                From = "G8ABC",
+                Recipients = ["M0LTE"],
+                Subject = $"Personal {i}",
+                Body = Encoding.Latin1.GetBytes("p\r"),
+            });
+        }
+
+        using HttpClient client = await StartAsync(forwardedPrefix: "/apps/bbs");
+
+        string inbox = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+        Assert.Contains("<a href=\"/apps/bbs/\">Inbox</a>", inbox, StringComparison.Ordinal);
+        Assert.Contains("<a href=\"/apps/bbs/bulletins\">Bulletins</a>", inbox, StringComparison.Ordinal);
+        Assert.Contains("<a href=\"/apps/bbs/compose\">Compose</a>", inbox, StringComparison.Ordinal);
+        Assert.Contains("href=\"/apps/bbs/messages/30\"", inbox, StringComparison.Ordinal);
+        Assert.Contains("href=\"/apps/bbs/?page=2\"", inbox, StringComparison.Ordinal); // pager keeps the prefix
+        Assert.DoesNotContain("href=\"/messages/", inbox, StringComparison.Ordinal);    // nothing escapes the mount
+
+        string older = await client.GetStringAsync(new Uri("/?page=2", UriKind.Relative));
+        Assert.Contains("href=\"/apps/bbs/?page=1\"", older, StringComparison.Ordinal); // and the "newer" leg
+
+        // The read page's kill form (M0LTE is an addressee, so it renders) posts under the mount too.
+        string read = await client.GetStringAsync(new Uri("/messages/30", UriKind.Relative));
+        Assert.Contains("action=\"/apps/bbs/messages/30/kill\"", read, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ForwardedPrefix_ComposeFormAndRedirect_CarryThePrefix()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        using HttpClient client = await StartAsync(forwardedPrefix: "/apps/bbs", autoRedirect: false);
+
+        string form = await client.GetStringAsync(new Uri("/compose", UriKind.Relative));
+        Assert.Contains("action=\"/apps/bbs/compose\"", form, StringComparison.Ordinal);
+
+        HttpResponseMessage response = await client.PostAsync(
+            new Uri("/compose", UriKind.Relative),
+            new FormUrlEncodedContent(
+            [
+                new KeyValuePair<string, string>("type", "P"),
+                new KeyValuePair<string, string>("to", "G8ABC"),
+                new KeyValuePair<string, string>("subject", "Prefixed"),
+                new KeyValuePair<string, string>("body", "x"),
+            ]));
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Equal("/apps/bbs/messages/1", response.Headers.Location!.OriginalString);
+    }
+
+    [Fact]
+    public async Task ForwardedPrefix_TrailingSlash_IsTrimmed()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message mine = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "Mine",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        using HttpClient client = await StartAsync(forwardedPrefix: "/apps/bbs/", autoRedirect: false);
+
+        HttpResponseMessage kill = await client.PostAsync(
+            new Uri($"/messages/{mine.Number}/kill", UriKind.Relative), content: null);
+        Assert.Equal(HttpStatusCode.Found, kill.StatusCode);
+        Assert.Equal("/apps/bbs/", kill.Headers.Location!.OriginalString); // not /apps/bbs//
     }
 }
