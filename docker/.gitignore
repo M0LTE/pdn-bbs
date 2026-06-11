@@ -1,0 +1,2 @@
+# LinBPQ writes its runtime state here (root-owned, wiped by smoke.sh).
+oracle/state/

@@ -1,0 +1,114 @@
+# LinBPQ mail oracle for pdn-bbs (the future Bbs.Interop.Tests target).
+#
+# Stands up LinBPQ with BPQMail enabled (node GB7BPQ / BBS GB7BPQ-1) plus a
+# net-sim simulated RF channel, so the oracle BBS is reachable two ways:
+#
+#   1. AX.25 over KISS-TCP via net-sim: attach to node a on host
+#      127.0.0.1:8200 and connect to GB7BPQ-1 over the simulated channel
+#      (the path a real pdn node / Bbs.Interop.Tests will use).
+#   2. Telnet on host 127.0.0.1:8210 (scripted driving in CI; see
+#      oracle/smoke.sh) — plus raw-TCP FBB on 127.0.0.1:8211 and the
+#      web Mail Mgmt UI on 127.0.0.1:8208.
+#
+# Patterned on the proven packet.net interop stack
+# (packet.net/docker/compose.interop.yml) — same pinned images, same
+# healthcheck style — with these deliberate differences:
+#   - project name / container names / subnet (172.31.0.0/24) / host ports
+#     are all distinct so this stack can run ALONGSIDE packet.net's
+#     (which owns 172.30.0.0/24 and host ports 8000/8008/8010/8080/81xx).
+#   - LinBPQ's /data is a HOST BIND MOUNT (oracle/state/, gitignored), not
+#     a named volume: the whole point of the oracle is that tests assert
+#     on the message store (Mail/m_*.mes, linmail.cfg, logs/ — spec §7.4).
+#     The container runs as root, so state files are root-owned on the
+#     host; oracle/smoke.sh wipes the dir via a throwaway container.
+#
+# Image-pin refresh procedure: see packet.net/docker/compose.interop.yml
+# header (docker pull + inspect RepoDigests, paste, small PR).
+
+name: pdnbbs-oracle
+
+services:
+
+  gb7bpq:
+    # m0lte/linbpq:latest @ 2026-05-12 — same digest the packet.net interop
+    # stack pins (~6.0.25.23), so oracle behaviour matches what that stack
+    # already proved against this binary.
+    image: m0lte/linbpq@sha256:872343ffb76a52316b1ae42a42d3c0893f545ccd577301ebc7c4455b292a8025
+    container_name: pdnbbs-gb7bpq
+    restart: unless-stopped
+    depends_on:
+      # The bpq32.cfg netsim PORT dials net-sim's KISS-TCP listener at
+      # 172.31.0.12:8202. BPQ retries the dial, so strict ordering isn't
+      # required, but waiting for netsim avoids slow first-dial backoff.
+      netsim:
+        condition: service_healthy
+    # Entrypoint shim (docs/linbpq-mail-compat.md §7.2): seed linmail.cfg
+    # into the WRITABLE state dir on first boot only. BPQMail rewrites its
+    # config file in place (web saves + housekeeping via
+    # /dev/shm/linmail.cfg.temp), so a read-only bind mount would break it
+    # — hence seed-and-copy instead of mounting it at /data directly.
+    # (Plain `cp -n` is avoided: coreutils >= 9.2 makes it exit non-zero
+    # when it skips, which `set -e` in a future shell would trip over.)
+    # Mail itself is enabled by the LINMAIL line in bpq32.cfg, so no
+    # `mail` argument is needed on the linbpq command line.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -f /data/linmail.cfg ] || cp /seed/linmail.cfg /data/linmail.cfg; exec /usr/local/bin/linbpq-entrypoint.sh "$@"'
+      - linbpq-oracle
+    volumes:
+      # Host-inspectable state (message store, rewritten linmail.cfg,
+      # logs, DIRMES.SYS, WFBID.SYS — spec §7.4). Gitignored.
+      - ./oracle/state:/data
+      # Canonical node config, read-only on top of the state mount.
+      - ./oracle/bpq32.cfg:/data/bpq32.cfg:ro
+      # Seed source for the entrypoint shim above.
+      - ./oracle/linmail.cfg:/seed/linmail.cfg:ro
+    ports:
+      - "127.0.0.1:8208:8008"   # HTTPPORT (web UI incl. Mail Mgmt)
+      - "127.0.0.1:8210:8010"   # TELNETPORT (node prompt -> BBS)
+      - "127.0.0.1:8211:8011"   # FBBPORT (raw-TCP FBB forwarding)
+    healthcheck:
+      # The LinBPQ image has bash but no curl / wget / nc — probe the HTTP
+      # listener with bash's /dev/tcp builtin (same probe the packet.net
+      # stack uses). Succeeds once LinBPQ has finished initialising.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8008 && exec 3<&-"]
+      interval: 5s
+      timeout: 3s
+      retries: 18
+      start_period: 30s
+    networks:
+      oraclenet:
+        ipv4_address: 172.31.0.10
+
+  netsim:
+    # ghcr.io/packethacking/net-sim:main @ 2026-06-06 — same digest as the
+    # packet.net stack (continuous-carrier fix, packethacking/net-sim#15).
+    image: ghcr.io/packethacking/net-sim@sha256:0fb896080a07e19dac4a16958e18538f9b827360254428b1bddf8821b3e7ace7
+    container_name: pdnbbs-netsim
+    restart: unless-stopped
+    volumes:
+      - ./oracle/network.yaml:/etc/sim/network.yaml:ro
+    ports:
+      - "127.0.0.1:8180:8080"   # web UI + /api/status
+      - "127.0.0.1:8200:8200"   # external KISS attach (node a) — our side
+    command: ["-autostart"]
+    healthcheck:
+      # net-sim image also has bash but no wget / curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3<&-"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 30s
+    networks:
+      oraclenet:
+        ipv4_address: 172.31.0.12
+
+networks:
+  oraclenet:
+    driver: bridge
+    ipam:
+      config:
+        # 172.30.0.0/24 belongs to the packet.net interop stack — this
+        # stack must be able to run alongside it on the same box.
+        - subnet: 172.31.0.0/24

@@ -1,0 +1,37 @@
+# Net-sim topology for the pdn-bbs LinBPQ mail oracle.
+#
+# Two simulated nodes on one afsk1200 channel:
+#
+#   a <-> b   node a is the EXTERNAL attach point (KISS-TCP listener on
+#             8200, exposed on the host as 127.0.0.1:8200) where our
+#             host-side BBS / pdn / Bbs.Interop.Tests attach; node b
+#             (KISS-TCP listener on 8202, internal to the compose
+#             network) is the channel LinBPQ (service gb7bpq) dials
+#             into as a KISS-TCP client.
+#
+# Shape, modem choice, and the FM-capture mixer settings are copied from
+# the proven packet.net interop stack (packet.net/docker/netsim/
+# network.yaml) — same image, same semantics. loss_db 10 is well above
+# the modem threshold so frames decode reliably.
+
+mixer_mode: fm_capture
+capture_db: 6.0
+collision_mode: silence
+
+nodes:
+  - id: a
+    ports:
+      - id: vhf
+        modem:
+          mode: afsk1200
+        kiss_port: 8200
+  - id: b
+    ports:
+      - id: vhf
+        modem:
+          mode: afsk1200
+        kiss_port: 8202
+
+links:
+  - { from: a.vhf, to: b.vhf, loss_db: 10 }
+  - { from: b.vhf, to: a.vhf, loss_db: 10 }
