@@ -16,25 +16,40 @@ public class OracleCollection : ICollectionFixture<OracleFixture>
 }
 
 /// <summary>
-/// Asserts the LinBPQ+BPQMail oracle stack (docker/compose.oracle.yml) is up and reachable,
+/// Asserts the LinBPQ+BPQMail oracle stack (docker/compose.oracle.yml) is up and SERVING,
 /// following the packet.net interop convention: the fixture does NOT bring the stack up —
 /// CI does (with <c>up -d --wait</c> gating on the healthchecks) and local runs do it by
-/// hand. It probes the two ports the tests use, with a deadline generous enough to absorb
-/// a stack that is healthy-but-settling.
+/// hand. Beyond the port probes it drives a full telnet login → <c>BBS</c> → prompt →
+/// sign-off round trip: container-healthy runs a beat ahead of BPQMail actually serving
+/// its application streams, and ONE dial against a not-ready oracle wedges a BBS stream
+/// ("All BBS Ports are in use") and poisons every test behind it.
 /// </summary>
+/// <remarks>
+/// The endpoints default to the documented stack (docker/README port map) and can be
+/// re-pointed at a PRIVATE oracle instance via <c>PDNBBS_ORACLE_KISS_PORT</c>,
+/// <c>PDNBBS_ORACLE_TELNET_PORT</c> and <c>PDNBBS_ORACLE_CONTAINER</c>. The oracle is a
+/// stateful singleton (one forwarding-partner identity, one RF channel), so two actors
+/// sharing one instance poison each other's sessions (docker/README delta 9) — a second
+/// developer/agent on the same box should run their own stack and point these at it. CI
+/// and ordinary local runs need none of them.
+/// </remarks>
 public sealed class OracleFixture
 {
     /// <summary>netsim node a — our KISS-TCP attach point (docker README port map).</summary>
     public const string KissHost = "127.0.0.1";
 
     /// <summary>netsim node a KISS-TCP port.</summary>
-    public const int KissPort = 8200;
+    public static readonly int KissPort = EnvInt("PDNBBS_ORACLE_KISS_PORT", 8200);
 
     /// <summary>LinBPQ telnet (node prompt → BBS).</summary>
-    public const int TelnetPort = 8210;
+    public static readonly int TelnetPort = EnvInt("PDNBBS_ORACLE_TELNET_PORT", 8210);
 
     /// <summary>The LinBPQ container name (compose.oracle.yml) — docker exec target.</summary>
-    public const string OracleContainer = "pdnbbs-gb7bpq";
+    public static readonly string OracleContainer =
+        Environment.GetEnvironmentVariable("PDNBBS_ORACLE_CONTAINER") is { Length: > 0 } c ? c : "pdnbbs-gb7bpq";
+
+    private static int EnvInt(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out int value) ? value : fallback;
 
     /// <summary>The oracle node callsign.</summary>
     public const string OracleNodeCall = "GB7BPQ";
@@ -50,31 +65,41 @@ public sealed class OracleFixture
 
     private static async Task ProbeAsync()
     {
-        // The compose healthchecks gate `up -d --wait`, so a CI stack is already
-        // healthy; the retry window here only absorbs listener-settle beats.
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        // The compose healthchecks gate `up -d --wait`, but container-healthy runs a
+        // beat ahead of BPQMail serving its application streams: a cold oracle greets
+        // telnet and still answers `BBS` with "All BBS Ports are in use". A dial
+        // against that wedges a BBS stream and poisons every test behind it — so gate
+        // on the real thing: a full login → BBS → prompt → sign-off round trip,
+        // retried (fresh connection each attempt; disposing frees the stream).
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(90);
         while (true)
         {
             try
             {
                 using var kiss = new TcpClient();
                 await kiss.ConnectAsync(KissHost, KissPort).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-                using var telnet = new TcpClient();
-                await telnet.ConnectAsync(KissHost, TelnetPort).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+
+                using var telnet = await TelnetBbsClient.ConnectAsync(KissHost, TelnetPort, CancellationToken.None)
+                    .ConfigureAwait(false);
+                await telnet.LoginAndEnterBbsAsync(CancellationToken.None).ConfigureAwait(false);
+                await telnet.SignOffAsync(CancellationToken.None).ConfigureAwait(false);
                 return;
             }
-            catch (Exception ex) when (ex is SocketException or TimeoutException or IOException)
+            catch (Exception ex) when (ex is SocketException or TimeoutException or IOException or InvalidOperationException)
             {
                 if (DateTime.UtcNow > deadline)
                 {
                     throw new InvalidOperationException(
-                        "The LinBPQ oracle stack is not reachable on " +
+                        "The LinBPQ oracle's BBS never answered a telnet login → BBS round trip on " +
                         $"{KissHost}:{KissPort} (netsim KISS) / :{TelnetPort} (telnet). " +
-                        "Bring it up first: docker compose -f docker/compose.oracle.yml up -d --wait",
+                        "Bring the stack up first (docker compose -f docker/compose.oracle.yml up -d --wait); " +
+                        "if it IS up, its BBS streams are likely wedged by a prior aborted run — " +
+                        "recycle it: down -v, wipe docker/oracle/state (root-owned: use a throwaway " +
+                        "container like smoke.sh does), up -d --wait.",
                         ex);
                 }
 
-                await Task.Delay(500).ConfigureAwait(false);
+                await Task.Delay(2000).ConfigureAwait(false);
             }
         }
     }
