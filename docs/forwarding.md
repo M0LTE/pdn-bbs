@@ -53,29 +53,49 @@ BPQ's forwarding *works* — the network runs on it — but operating it teaches
 
 **12. The implicit-vs-explicit AT muddle.** A bare `@CALL` matching a partner's own call is magic BPQ users rely on. → Kept (compat), but explain names it ("matched: implied-AT — partner's own callsign"), and lint suggests the explicit form.
 
+## Vocabulary: the jargon goes away (Tom, 2026-06-11)
+
+The wire keeps speaking FBB (it must), and the terse RF console keeps its classic letters (clients pattern-match them) — but **our configuration, webmail, explain output, logs, and docs use plain language only**. The legacy terms appear exactly once in our surfaces: in the translation table below, for operators arriving from BPQ.
+
+| Legacy | Ours | Meaning |
+|---|---|---|
+| AT / `@BBS` field | **mail for** | mail addressed to stations whose home BBS is X |
+| implied-AT | *(no name — just behaviour)* | a partner naturally receives mail addressed to stations homed on it |
+| HR / hierarchical routes | **regions** | the network's geographic tree (`gbr.euro`, `#23.gbr.euro`) |
+| BBSHA / H-address | **network address** | where a BBS sits in that tree (`gb7rdg.#23.gbr.euro`) |
+| TO-distribution (bulletins) | **topics** | bulletin categories (`SALE`, `ARRL`, …) |
+| BID / MID | **network id** | the network-wide dedup identity of a message |
+| FWDTimes | **window** | when dialling is allowed |
+| RequestReverse | **collect** | also pick up waiting mail when we have nothing to send |
+| flood vs directed bulletin | **broadcast** vs **routed** | sent to every matching partner vs the best single one |
+| WP / White Pages | **the network directory** | who is homed where |
+| R: lines | **routing trace** | the hop-by-hop history (R: on the wire, words on screen) |
+| FWD QUEUE / REROUTEMSGS | **queue / re-route** | plain words on every surface |
+
+Explain output speaks the same language: *"personal → GB7RDG-2: it carries mail for stations in region gbr.euro (closest match)"*, never "matched HR at depth 3". The F-1 config rename drops the legacy keys outright (pre-1.0, single deployment — no alias shims); the F-2 webmail/console sysop surfaces are built jargon-free from the start.
+
 ## Configuration shape (the end state)
 
 ```yaml
 partners:
-  - call: GB7RDG-2            # exact, incl. SSID (inbound match + identity)
-    connect: GB7RDG-2          # bare call = direct dial; or:
-    # connectScript:           # full §4.4 semantics for node navigation
-    #   - C GB7RDG
-    #   - BBS
+  - call: GB7RDG-2             # exact, incl. SSID (who answers / who we dial)
+    dial: GB7RDG-2             # bare call = direct; or steps: [C GB7RDG, BBS]
     enabled: true
-    intervalMinutes: 30
-    sendImmediately: true
-    requestReverse: true       # poll even with an empty queue (collect our mail)
-    times: []                  # empty = always; else ["02:00-06:00", ...]
+    every: 30m
+    immediately: true          # dial as soon as something queues
+    collect: true              # also pick up waiting mail when we have nothing to send
+    window: []                 # when dialling is allowed; empty = always; ["02:00-06:00"]
     priority: null             # explicit tie-break; null = call order
-    to: []                     # TO-distribution (e.g. [SYSOP])
-    at: ["*"]                  # AT routes; "*" = wildcard default route
-    hr: [GBR.EURO]             # hierarchical routes (flood needs bbsHa)
-    bbsHa: GB7RDG.#23.GBR.EURO
-    maxRx: 99999
-    maxTx: 99999
+    networkAddress: gb7rdg.#23.gbr.euro   # where this partner sits in the network tree
+    sends:
+      mailFor: [gb7rdg-2]      # mail addressed to stations homed on these BBSes
+      regions: [gbr.euro]      # this partner carries mail toward these regions
+      topics: []               # bulletin categories to pass on (e.g. [SALE, ARRL])
+    limits:
+      receive: 99999           # per-message size caps, bytes
+      send: 99999
     protocol:                  # F-1
-      b2: false                # B2F opt-in when built
+      b2: false                # newer compressed variant, opt-in when built
       maxBlock: 10000
 ```
 
