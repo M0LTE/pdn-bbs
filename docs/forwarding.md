@@ -17,7 +17,8 @@ Everything BPQMail's forwarding configuration can express, ours must too. The in
 | NTS routing by TO wildcards | T-type routing | F-3 (spec SHOULD) |
 | Per-partner protocol options (B/B1/B2, MaxBlock) | `protocol:` block (b1 default; maxBlock F-1; **b2 promoted to F-1** — the GB7RDG config snapshot shows B2F is the production lingua franca, 7 of its 9 enabled partners; B1F suffices for the GB7RDG↔us pair itself) | F-1 |
 | Per-partner size caps (MaxRX/MaxTX) | `maxRx`/`maxTx` | ✅ shipped |
-| Reverse polling (`RequestReverse`) | `requestReverse: true` — dial on interval even with an empty queue to collect | F-1 |
+| In-session reverse (`DoReverse`, default on) | inherent — every session drains BOTH directions (FbbSession TakeTurn; oracle-proven both roles vs stock `RequestReverse=0` BPQ, `BidirectionalForwardingInteropTests`) | ✅ shipped |
+| Reverse polling (`RequestReverse`/`RevFWDInterval`) | `collect:` — dial on a timer even with an empty queue. Opt-in safety net ONLY for partners that cannot dial us (asymmetric links, e.g. GB7RDG→GB7CIP for the WW feed); on a symmetric link it is redundant chatter | F-1 (demoted) |
 | `FWD <partner> NOW` | console `FWD` sysop verb + webmail button + the scheduler nudge | F-2 |
 | `FWD QUEUE` inspection | console verb + webmail sysop view | F-2 |
 | `REROUTEMSGS` | **automatic** re-route on config apply (see wart 8) + explicit requeue surface | F-2 |
@@ -66,13 +67,19 @@ The wire keeps speaking FBB (it must), and the terse RF console keeps its classi
 | TO-distribution (bulletins) | **topics** | bulletin categories (`SALE`, `ARRL`, …) |
 | BID / MID | **network id** | the network-wide dedup identity of a message |
 | FWDTimes | **window** | when dialling is allowed |
-| RequestReverse | **collect** | also pick up waiting mail when we have nothing to send |
+| RequestReverse | **collect** | dial on a timer just to pick up waiting mail — only for partners that cannot dial us (in-session pickup needs no config; it always happens) |
 | flood vs directed bulletin | **broadcast** vs **routed** | sent to every matching partner vs the best single one |
 | WP / White Pages | **the network directory** | who is homed where |
 | R: lines | **routing trace** | the hop-by-hop history (R: on the wire, words on screen) |
 | FWD QUEUE / REROUTEMSGS | **queue / re-route** | plain words on every surface |
 
 Explain output speaks the same language: *"personal → GB7RDG-2: it carries mail for stations in region gbr.euro (closest match)"*, never "matched HR at depth 3". The F-1 config rename drops the legacy keys outright (pre-1.0, single deployment — no alias shims); the F-2 webmail/console sysop surfaces are built jargon-free from the start.
+
+## Delivery posture (Tom, 2026-06-11): immediate + turnaround, never polling
+
+Mail moves because **whoever holds it dials at once** (`immediately: true`, the default), and **every session drains both directions** (FBB in-session reverse is inherent to the block flow — when the caller's proposals are done the answerer gets the turn; proven both ways against stock BPQ with `RequestReverse=0`). Timers are safety nets, not the delivery mechanism: `every` is the retry cadence for queued-but-undelivered mail (the scheduler never dials an empty queue), and `collect` (timed empty-queue polling, BPQ's `RequestReverse`) exists only for asymmetric links where the partner cannot dial us. A quiet link stays quiet.
+
+BPQ trap this design dodges (found live, `BidirectionalForwardingInteropTests`): BPQ SSID-strips inbound AX.25 connects before its partner lookup, so a partner record keyed with an SSID silently breaks the reverse-queue join — the dial-in lands on an auto-created plain user and reverse never proposes. BPQ-side partner records for us must be keyed by **base callsign** (production GB7RDG base-keys all 24 of its records).
 
 ## Configuration shape (the end state)
 
@@ -81,9 +88,10 @@ partners:
   - call: GB7RDG-2             # exact, incl. SSID (who answers / who we dial)
     dial: GB7RDG-2             # bare call = direct; or steps: [C GB7RDG, BBS]
     enabled: true
-    every: 30m
-    immediately: true          # dial as soon as something queues
-    collect: true              # also pick up waiting mail when we have nothing to send
+    every: 30m                 # RETRY cadence for queued mail; an empty queue never dials
+    immediately: true          # dial as soon as something queues (the default posture)
+    collect: false             # timed empty-queue polling — only for partners that can't
+                               # dial us; sessions drain both directions regardless
     window: []                 # when dialling is allowed; empty = always; ["02:00-06:00"]
     priority: null             # explicit tie-break; null = call order
     networkAddress: gb7rdg.#42.gbr.euro   # where this partner sits in the network tree
@@ -108,7 +116,7 @@ partners:
 ## Build waves
 
 - **F-0 (in flight):** greet-first demux + full §4.4 connect scripts with per-step timeouts and attempt transcripts.
-- **F-1 — parity + the home-BBS rule:** **local-delivery-beats-forwarding** (at-is-us / TO-is-local-user → zero targets; the wildcard-AT leak pinned by tests — see design.md § The home-BBS requirement) + auto-create users on inbound personals; time windows, reverse polling, per-recipient fan-out, the `protocol:` block (maxBlock enforcement; b2 stub), `priority`.
+- **F-1 — parity + the home-BBS rule:** **local-delivery-beats-forwarding** (at-is-us / TO-is-local-user → zero targets; the wildcard-AT leak pinned by tests — see design.md § The home-BBS requirement) + auto-create users on inbound personals; time windows, `collect` (timed empty-queue polling — opt-in safety net for partners that cannot dial us; in-session reverse already shipped), per-recipient fan-out, the `protocol:` block (maxBlock enforcement; B2F — promoted, it is the production lingua franca), `priority`.
 - **F-2 — the de-warting ops layer:** health tracking + session stats, auto-re-route-on-config-apply, console `FWD`/`ROUTE?` verbs, the webmail sysop pages.
 - **F-3 — spec SHOULDs that touch forwarding:** NTS routing, WP consumption AND emission (announcing homed users to the network — promoted by the home-BBS requirement), B2F.
 

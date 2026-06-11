@@ -101,11 +101,19 @@ public sealed record PartnerConfig
     /// </summary>
     public int ConTimeoutSeconds { get; init; } = 60;
 
-    /// <summary>Auto-dial poll interval, minutes (compat spec §4.1 FwdInterval; default 60).</summary>
+    /// <summary>
+    /// Retry cadence for QUEUED mail, minutes (compat spec §4.1 FwdInterval; default 60).
+    /// The scheduler never dials an empty queue — this is a retry timer, not a poll.
+    /// </summary>
     public int IntervalMinutes { get; init; } = 60;
 
-    /// <summary>Dial as soon as a message is queued (compat spec §4.1 FWDNewImmediately).</summary>
-    public bool SendImmediately { get; init; }
+    /// <summary>
+    /// Dial as soon as a message is queued (compat spec §4.1 FWDNewImmediately).
+    /// Default TRUE — the delivery posture is immediate delivery + in-session reverse
+    /// (every FBB session drains both directions, spec §3.11), with timers as safety
+    /// nets; BPQ's default-off + interval-polling model is the wart, not the target.
+    /// </summary>
+    public bool SendImmediately { get; init; } = true;
 
     /// <summary>TO-field distribution list (compat spec §4.1 TOCalls).</summary>
     public List<string> To { get; init; } = [];
@@ -244,6 +252,13 @@ public static class BbsHostConfigFile
           pass: null
 
         # partners: BBS forwarding partners (compat spec §4.1, v1 subset).
+        #
+        # Delivery posture: mail moves because whoever HOLDS it dials at once
+        # (sendImmediately, the default), and every session drains BOTH directions
+        # (FBB in-session reverse — when our proposals are done the partner gets the
+        # turn, and vice versa; oracle-proven both ways). intervalMinutes is only the
+        # RETRY cadence for mail that could not be delivered — the BBS never dials an
+        # empty queue, so a quiet link stays quiet. No polling timers to tune.
         #   call:            partner callsign, exact incl. SSID (inbound match is exact)
         #   connect:         simple connect form — the callsign/alias outbound cycles
         #                    dial (default: call). Equivalent to a one-line script
@@ -258,8 +273,9 @@ public static class BbsHostConfigFile
         #                    with backoff).
         #   conTimeoutSeconds: per-response-wait timeout for the script + the final SID
         #                    wait (compat spec §4.1 ConTimeout; default 60)
-        #   intervalMinutes: auto-dial poll interval (default 60)
-        #   sendImmediately: dial as soon as a message queues (default false)
+        #   intervalMinutes: retry cadence for queued-but-undelivered mail (default 60;
+        #                    never dials an empty queue)
+        #   sendImmediately: dial as soon as a message queues (default true)
         #   to:              TO-field distribution list, e.g. [SYSOP]
         #   at:              AT-field list; "*" entries are the wildcard default route
         #   hr:              hierarchical routes, e.g. [GBR.EURO] (flood matching also
