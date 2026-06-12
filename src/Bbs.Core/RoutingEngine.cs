@@ -198,14 +198,37 @@ public sealed class RoutingEngine
     }
 
     /// <summary>
+    /// True when a message's <b>AT designator names this BBS</b> — its leaf element is our own
+    /// call (same base-call comparison as implied-AT, <see cref="ImpliedAtMatches"/>), or it is a
+    /// WW-rooted address sitting under our own HA (<c>_ownHa.AreaContains(at)</c>: all of our HA
+    /// elements, including our call, match the AT root-first). This is the load-bearing half of
+    /// the rule #1 local-delivery signal (the half that does <b>not</b> depend on the recipient
+    /// already being a known user): an empty AT is never us by this test. Used both by
+    /// <see cref="ResolvesToLocal"/> (rule #1) and by the inbound auto-create path
+    /// (design.md "The home-BBS requirement" rule #2), which must fire on exactly the AT-is-us
+    /// case — a mailbox homed here — and not on the no-AT-existing-user case.
+    /// </summary>
+    public bool AtResolvesToLocal(string? at)
+        => AtResolvesToLocal(HierarchicalAddress.Parse(at));
+
+    private bool AtResolvesToLocal(HierarchicalAddress at)
+    {
+        string atBbs = at.AtBbs;
+        if (atBbs.Length == 0)
+        {
+            return false;
+        }
+
+        return Callsigns.BaseEquals(atBbs, _ownCall)
+            || (at.IsWwRooted && _ownHa.AreaContains(at));
+    }
+
+    /// <summary>
     /// True when a personal resolves to a mailbox on this BBS (design.md rule #1). Two cases,
     /// mirroring the flood test's <c>at.AreaContains(_ownHa)</c> / <see cref="HierarchicalAddress.IsWwRooted"/>
     /// style:
     /// <list type="number">
-    /// <item>The AT names us — its leaf element is our own call (same base-call comparison as
-    /// implied-AT, <see cref="ImpliedAtMatches"/>), or it is a WW-rooted address sitting under
-    /// our own HA (<c>_ownHa.AreaContains(at)</c>: all of our HA elements, including our call,
-    /// match the AT root-first).</item>
+    /// <item>The AT names us (<see cref="AtResolvesToLocal(HierarchicalAddress)"/>).</item>
     /// <item>There is no AT and the TO is a known local user — the caller resolved that against
     /// the user store. This is the case a wildcard-AT partner would otherwise swallow.</item>
     /// </list>
@@ -218,8 +241,7 @@ public sealed class RoutingEngine
             return toIsLocalUser;
         }
 
-        return Callsigns.BaseEquals(atBbs, _ownCall)
-            || (at.IsWwRooted && _ownHa.AreaContains(at));
+        return AtResolvesToLocal(at);
     }
 
     private bool IsEligible(Partner partner, RoutingRequest request)
