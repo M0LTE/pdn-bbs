@@ -536,13 +536,24 @@ public sealed class FbbSession
             // "after FS, the proposer transmits the accepted messages
             // immediately, in proposal order, with no per-message framing
             // between FS and the first byte" (spec §3.4).
+            //
+            // The body transfer is emitted BEFORE its FbbOutboundResult: the host
+            // clears the queue entry (BbsStore.MarkForwarded) on the result, so a
+            // body send that fails — e.g. the node reports the AX.25 session gone
+            // ("Not connected") when a multi-frame body can't be pushed over a
+            // half-duplex link — must abort the host's action loop before the mark,
+            // leaving the message queued for the next cycle instead of silently
+            // dropping it. On success the order is immaterial (the result carries no
+            // wire output). Rejected/deferred proposals carry no body, so their
+            // result is emitted alone.
             for (var i = 0; i < batch.Count; i++)
             {
-                actions.Add(new FbbOutboundResult(batch[i], answers[i]));
                 if (answers[i].Kind == FsAnswerKind.Accept)
                 {
                     SendMessage(batch[i], answers[i].Offset, actions);
                 }
+
+                actions.Add(new FbbOutboundResult(batch[i], answers[i]));
             }
 
             _proposedBatch = null;
