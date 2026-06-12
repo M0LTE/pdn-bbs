@@ -30,6 +30,9 @@ public sealed record BbsHostConfig
     /// <summary>Webmail bind (loopback per the app-gateway contract).</summary>
     public WebConfig Web { get; init; } = new();
 
+    /// <summary>The optional IMAP server (default off) — lets iPhone Mail / any IMAP client read packet mail.</summary>
+    public ImapConfig Imap { get; init; } = new();
+
     /// <summary>The node's RHPv2 endpoint.</summary>
     public RhpConfig Rhp { get; init; } = new();
 
@@ -52,6 +55,59 @@ public sealed record WebConfig
 
     /// <summary>Port; must match the <c>ui.upstream</c> in pdn-app.yaml.</summary>
     public int Port { get; init; } = 18090;
+}
+
+/// <summary>
+/// The IMAP4rev1 read-mostly server (default off). When <see cref="Enabled"/>, a TCP listener
+/// on <see cref="Bind"/>:<see cref="Port"/> lets an external mail client (iPhone Mail, Thunderbird,
+/// MailKit) read packet mail; the login is the user's callsign + their BBS mail-password
+/// (<see cref="BbsStore.VerifyMailPassword"/>, set in webmail). Off by default ⇒ a node that does
+/// not configure it behaves exactly as before. The bind may be a LAN address (unlike webmail, whose
+/// loopback bind is the app-gateway trust boundary) — pair a LAN bind with <see cref="ImapTlsConfig"/>.
+/// </summary>
+public sealed record ImapConfig
+{
+    /// <summary>Whether the IMAP listener is started at all (default false — the whole feature is opt-in).</summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>Bind address. Loopback by default; a LAN address exposes the server to the local network (use TLS).</summary>
+    public string Bind { get; init; } = "127.0.0.1";
+
+    /// <summary>
+    /// TCP port. Defaults to 1143 (the IANA unprivileged IMAP test port) so a non-root app needs no
+    /// capability to bind it; set 143 (plaintext) or 993 (implicit TLS) when run with the privilege to.
+    /// </summary>
+    public int Port { get; init; } = 1143;
+
+    /// <summary>Implicit-TLS settings (default off ⇒ plaintext). When on, every accepted socket is wrapped in TLS.</summary>
+    public ImapTlsConfig Tls { get; init; } = new();
+}
+
+/// <summary>
+/// Implicit-TLS configuration for the IMAP listener (RFC 8314: TLS from the first byte, the iPhone
+/// "SSL" model on port 993). When <see cref="Enabled"/> the server wraps each accepted socket in an
+/// <see cref="System.Net.Security.SslStream"/> with server authentication; the certificate is the
+/// operator-supplied PKCS#12 at <see cref="CertificatePath"/>, or — when none is given and
+/// <see cref="GenerateSelfSigned"/> — a self-signed certificate generated on first start and persisted
+/// under the state directory (browsers/clients warn until it is trusted, but the channel is encrypted).
+/// </summary>
+public sealed record ImapTlsConfig
+{
+    /// <summary>Whether accepted sockets are wrapped in implicit TLS (default false ⇒ plaintext IMAP).</summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>Path to an operator-supplied PKCS#12 (.pfx) certificate; when set it wins over self-signed.</summary>
+    public string? CertificatePath { get; init; }
+
+    /// <summary>Password for <see cref="CertificatePath"/>, or null for an unencrypted PKCS#12.</summary>
+    public string? CertificatePassword { get; init; }
+
+    /// <summary>
+    /// When no <see cref="CertificatePath"/> is supplied, generate (and persist) a self-signed
+    /// certificate on first start (default true). Set false to require an operator-supplied cert —
+    /// TLS then does not start unless one is configured.
+    /// </summary>
+    public bool GenerateSelfSigned { get; init; } = true;
 }
 
 /// <summary>RHPv2 endpoint + credentials. Null host/port defer to the supervisor environment.</summary>
@@ -250,6 +306,34 @@ public static class BbsHostConfigFile
         web:
           bind: 127.0.0.1
           port: 18090
+
+        # imap: an optional read-mostly IMAP4rev1 server so iPhone Mail (or any IMAP
+        #       client) can read packet mail. DEFAULT OFF — leave it off and the node
+        #       behaves exactly as before. The login is the user's CALLSIGN plus their BBS
+        #       mail-password (set in webmail); a callsign with no mail-password set cannot
+        #       log in. Unlike webmail (loopback-only, the app-gateway trust boundary), the
+        #       IMAP bind MAY be a LAN address so a phone on the home network can reach it —
+        #       pair a LAN bind with tls.enabled.
+        #   enabled: start the IMAP listener at all (default false)
+        #   bind:    bind address (default 127.0.0.1; set 0.0.0.0 or a LAN IP for phones)
+        #   port:    TCP port (default 1143 — an unprivileged port; use 143 plaintext or 993
+        #            implicit-TLS when the app has the privilege to bind them)
+        #   tls:     implicit TLS (RFC 8314 — TLS from the first byte, the iPhone "SSL" model)
+        #     enabled:             wrap every connection in TLS (default false ⇒ plaintext)
+        #     certificatePath:     operator-supplied PKCS#12 (.pfx); wins over self-signed
+        #     certificatePassword: password for that .pfx (null if unencrypted)
+        #     generateSelfSigned:  when no certificatePath, generate + persist a self-signed
+        #                          cert on first start (default true; clients warn until it
+        #                          is trusted, but the channel is encrypted)
+        imap:
+          enabled: false
+          bind: 127.0.0.1
+          port: 1143
+          tls:
+            enabled: false
+            certificatePath: null
+            certificatePassword: null
+            generateSelfSigned: true
 
         # rhp: the node's RHPv2 endpoint. When omitted (or null) the supervisor
         #      environment (PDN_RHP_HOST / PDN_RHP_PORT) is used, falling back to
