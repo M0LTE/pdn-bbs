@@ -226,6 +226,34 @@ public sealed class BbsStoreTests : IDisposable
     }
 
     [Fact]
+    public void EnsureUser_CreatesSkeletalRecord_IdempotentOnBaseCall()
+    {
+        // First inbound personal homed here for an unknown TO → a skeletal record (callsign
+        // only; name/QTH/Home left null) so the mail is listable on first connect (rule #2).
+        Assert.False(_ts.Store.UserExists("G0UNK"));
+        Assert.True(_ts.Store.EnsureUser("G0UNK"));
+        Assert.True(_ts.Store.UserExists("G0UNK"));
+
+        User created = _ts.Store.GetUser("G0UNK")!;
+        Assert.Equal("G0UNK", created.Callsign);
+        Assert.Null(created.Name);
+        Assert.Null(created.HomeBbs);
+        Assert.Equal(0, created.LastListedNumber);
+
+        // Idempotent: a second inbound to the same TO (with or without SSID) creates nothing
+        // more and does not error.
+        Assert.False(_ts.Store.EnsureUser("G0UNK"));
+        Assert.False(_ts.Store.EnsureUser("G0UNK-7"));
+        Assert.Single(_ts.Store.ListUsers());
+
+        // Keyed by the base call: a record stored with an SSID is matched, never duplicated.
+        _ts.Store.UpsertUser(new User { Callsign = "G4ABC-2", Name = "Ann" });
+        Assert.False(_ts.Store.EnsureUser("G4ABC"));
+        Assert.Equal("Ann", _ts.Store.GetUser("G4ABC-2")!.Name); // existing data untouched
+        Assert.Equal(2, _ts.Store.ListUsers().Count); // G0UNK + G4ABC-2, no skeletal G4ABC added
+    }
+
+    [Fact]
     public void Partners_RoundTrip_AndListOrderedByCall()
     {
         var partner = new Partner

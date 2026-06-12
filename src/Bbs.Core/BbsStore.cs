@@ -652,14 +652,20 @@ public sealed class BbsStore : IDisposable
 
         lock (_gate)
         {
-            // Match a stored bare base call ($base) or one carrying an SSID ($base-…).
-            using SqliteCommand cmd = Command(null,
-                "SELECT 1 FROM users WHERE callsign=$base OR callsign LIKE $prefix ESCAPE '\\' LIMIT 1;");
-            cmd.Parameters.AddWithValue("$base", baseCall);
-            cmd.Parameters.AddWithValue("$prefix", EscapeLike(baseCall) + "-%");
-            using SqliteDataReader reader = cmd.ExecuteReader();
-            return reader.Read();
+            return UserExistsCore(baseCall);
         }
+    }
+
+    /// <summary>Base-call membership test (caller holds <see cref="_gate"/>); <paramref name="baseCall"/> already normalised + SSID-stripped.</summary>
+    private bool UserExistsCore(string baseCall)
+    {
+        // Match a stored bare base call ($base) or one carrying an SSID ($base-…).
+        using SqliteCommand cmd = Command(null,
+            "SELECT 1 FROM users WHERE callsign=$base OR callsign LIKE $prefix ESCAPE '\\' LIMIT 1;");
+        cmd.Parameters.AddWithValue("$base", baseCall);
+        cmd.Parameters.AddWithValue("$prefix", EscapeLike(baseCall) + "-%");
+        using SqliteDataReader reader = cmd.ExecuteReader();
+        return reader.Read();
     }
 
     /// <summary>Escapes SQL LIKE metacharacters in a literal prefix (used with <c>ESCAPE '\'</c>).</summary>
@@ -706,6 +712,43 @@ public sealed class BbsStore : IDisposable
             cmd.Parameters.AddWithValue("$listed", user.LastListedNumber);
             cmd.Parameters.AddWithValue("$pdn", (object?)user.PdnUsername ?? DBNull.Value);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Ensures a skeletal user record exists for <paramref name="callsign"/>, keyed by its base
+    /// (SSID-stripped) callsign so it is found by <see cref="UserExists"/> and joins the same
+    /// recipient rows (<see cref="Callsigns.NormalizeAddressee"/> semantics). Idempotent: a no-op
+    /// when the user already exists (matched on the base call), creating nothing and overwriting
+    /// nothing — name/QTH/Home are left for the console's first-connect persistence to fill.
+    ///
+    /// This is the store half of the home-BBS auto-create (design.md "The home-BBS requirement"
+    /// rule #2): mail homed here can arrive before its owner ever connects, so a record must be
+    /// created on first inbound delivery to make that mail listable on their first <c>L</c>.
+    /// Returns true when a new record was created, false when one already existed.
+    /// </summary>
+    public bool EnsureUser(string callsign)
+    {
+        ArgumentNullException.ThrowIfNull(callsign);
+        string baseCall = Callsigns.StripSsid(Callsigns.Normalize(callsign));
+        if (baseCall.Length == 0)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            // Idempotent on the same base-call membership UserExists uses — including a stored
+            // record that happens to carry an SSID — so we never insert a duplicate skeletal row.
+            if (UserExistsCore(baseCall))
+            {
+                return false;
+            }
+
+            using SqliteCommand cmd = Command(null,
+                "INSERT OR IGNORE INTO users(callsign,last_listed_number) VALUES($c,0);");
+            cmd.Parameters.AddWithValue("$c", baseCall);
+            return cmd.ExecuteNonQuery() > 0;
         }
     }
 
