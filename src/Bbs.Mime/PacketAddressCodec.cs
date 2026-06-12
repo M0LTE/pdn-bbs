@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 
 namespace Bbs.Mime;
@@ -9,26 +10,32 @@ namespace Bbs.Mime;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The problem: a packet address can contain <c>#</c> (the area marker, e.g. <c>#42</c>), which is
+/// The hard case: a packet address can contain <c>#</c> (the area marker, e.g. <c>#42</c>), which is
 /// illegal in an email domain, and the full hierarchical route <b>cannot be re-derived</b> from a
 /// fragment — so the whole address must survive a round-trip <b>losslessly and statelessly</b>
-/// inside an addr-spec. We do that by base32-encoding the entire packet address into the local part:
-/// <c>&lt;base32(packetAddress)&gt;@&lt;mailDomain&gt;</c>.
-/// </para>
-/// <para>
-/// Why base32 (RFC 4648, alphabet <c>A-Z2-7</c>, no padding) and not base64:
+/// inside an addr-spec. But most packet addresses are perfectly DNS-shaped, and forcing those through
+/// an opaque blob makes for an ugly, unrecognisable <c>To:</c>. So the codec is a <b>readable-first
+/// hybrid</b>:
 /// <list type="bullet">
-/// <item>Collision-free and exactly reversible over the raw address bytes.</item>
-/// <item>Charset-safe in an email local part (no <c>+ / =</c> or other dot-atom-unsafe characters).</item>
-/// <item><b>Case-insensitive-decodable</b>: some clients lower-case the local part. Base32's alphabet
-///   is a single case, so we can upper-case before decoding and still recover the exact bytes — base64
-///   is case-sensitive and would not survive a client lowercasing the local part.</item>
+/// <item><b>Readable form</b> — when every element is a valid DNS label, the address maps to ordinary
+///   labels: <c>M0LTE</c> → <c>M0LTE@&lt;mailDomain&gt;</c>; <c>M0LTE@GB7RDG.GBR.EURO</c> →
+///   <c>M0LTE@gb7rdg.gbr.euro.&lt;mailDomain&gt;</c>. The route rides the domain in lower case and is
+///   upper-cased on decode, surviving a client that lower-cases what it echoes back.</item>
+/// <item><b>Base32 escape</b> — only when an element can't be a domain label (chiefly <c>#</c>) does the
+///   whole address go base32 (RFC 4648, <c>A-Z2-7</c>, no padding) into the local part, tagged with a
+///   reserved subdomain: <c>M0LTE@GB7RDG.#42.GBR.EURO</c> →
+///   <c>&lt;base32&gt;@b32.&lt;mailDomain&gt;</c>.</item>
 /// </list>
 /// </para>
 /// <para>
-/// The encoding is the UTF-8 (== ASCII for any real packet address) bytes of the verbatim address, so
-/// <c>Decode(Encode(x)) == x</c> byte-for-byte for every input. <see cref="TryDecode"/> returns false
-/// for anything not in this scheme (a genuine external address such as <c>someone@gmail.com</c>).
+/// Base32 (not base64) for the escape because it is collision-free and exactly reversible over the raw
+/// bytes, charset-safe in a local part (no <c>+ / =</c>), and <b>case-insensitive-decodable</b> — its
+/// single-case alphabet survives a client lower-casing the local part, which base64 would not.
+/// </para>
+/// <para>
+/// Either form decodes back to the exact canonical (upper-cased) address, so
+/// <c>Decode(Encode(x)) == x</c> for every input. <see cref="TryDecode"/> returns false for anything
+/// not in this scheme (a genuine external address such as <c>someone@gmail.com</c>).
 /// </para>
 /// </remarks>
 public static class PacketAddressCodec
@@ -48,22 +55,50 @@ public static class PacketAddressCodec
     public const int MaxPacketAddressLength = MaxLocalPartLength * 5 / 8; // 40
 
     /// <summary>
-    /// Encodes a verbatim packet address into the synthetic addr-spec
-    /// <c>&lt;base32(packetAddress)&gt;@&lt;mailDomain&gt;</c>.
+    /// The reserved subdomain label that tags a base32-escaped address (<c>&lt;base32&gt;@b32.&lt;mailDomain&gt;</c>),
+    /// so the decoder knows to base32-decode the local part rather than read it as a readable route.
     /// </summary>
-    /// <param name="packetAddress">The full packet address, verbatim (e.g. <c>M0LTE@GB7RDG.#42.GBR.EURO</c>).</param>
+    private const string EncodedMarkerLabel = "b32";
+
+    /// <summary>
+    /// Encodes a packet address into a synthetic addr-spec, <b>readable</b> wherever the address can be
+    /// expressed as ordinary domain labels:
+    /// <list type="bullet">
+    /// <item><c>M0LTE</c> → <c>M0LTE@&lt;mailDomain&gt;</c></item>
+    /// <item><c>M0LTE@GB7RDG</c> → <c>M0LTE@gb7rdg.&lt;mailDomain&gt;</c></item>
+    /// <item><c>M0LTE@GB7RDG.GBR.EURO</c> → <c>M0LTE@gb7rdg.gbr.euro.&lt;mailDomain&gt;</c> (no hash → fully readable)</item>
+    /// </list>
+    /// It falls back to the lossless <b>base32 escape</b> (<c>&lt;base32(address)&gt;@b32.&lt;mailDomain&gt;</c>)
+    /// ONLY when a route element can't be a domain label — chiefly the <c>#</c> area marker
+    /// (<c>M0LTE@GB7RDG.#42.GBR.EURO</c>), which is illegal in a domain. Either form decodes back to the
+    /// exact (upper-cased canonical) address. Callsigns/regions are case-insensitive, so the address is
+    /// canonicalised to upper case; the readable route rides the domain in lower case and upper-cases on
+    /// decode, surviving a client that lower-cases what it echoes back.
+    /// </summary>
+    /// <param name="packetAddress">The full packet address (e.g. <c>M0LTE@GB7RDG.#42.GBR.EURO</c>, a bare <c>M0LTE</c>, a category <c>NEWS</c>).</param>
     /// <param name="mailDomain">The BBS's synthetic mail domain (e.g. <c>pdn</c>).</param>
-    /// <returns>An RFC 5322 addr-spec whose local part losslessly carries the whole address.</returns>
     /// <exception cref="ArgumentException">
-    /// Thrown when the address is so long its base32 would exceed the 64-octet local-part cap
-    /// (see <see cref="MaxPacketAddressLength"/>).
+    /// Thrown only on the base32-escape path when the address is so long its base32 would exceed the
+    /// 64-octet local-part cap (see <see cref="MaxPacketAddressLength"/>).
     /// </exception>
     public static string Encode(string packetAddress, string mailDomain)
     {
         ArgumentNullException.ThrowIfNull(packetAddress);
         ArgumentException.ThrowIfNullOrEmpty(mailDomain);
 
-        byte[] bytes = Encoding.UTF8.GetBytes(packetAddress);
+        // Canonicalise to upper case (callsigns/regions are case-insensitive) so the round-trip is
+        // stable even when a client lower-cases the address it echoes back.
+        string addr = packetAddress.Trim().ToUpperInvariant();
+
+        if (TryReadableForm(addr, mailDomain, out string? readable))
+        {
+            return readable;
+        }
+
+        // Escape: a route element is not a valid domain label (the '#' area marker, or another
+        // unrepresentable char), so the WHOLE address goes base32 into the local part, tagged with the
+        // reserved subdomain.
+        byte[] bytes = Encoding.UTF8.GetBytes(addr);
         if (bytes.Length > MaxPacketAddressLength)
         {
             throw new ArgumentException(
@@ -72,21 +107,19 @@ public static class PacketAddressCodec
                 nameof(packetAddress));
         }
 
-        string localPart = Base32Encode(bytes);
-        return $"{localPart}@{mailDomain}";
+        return $"{Base32Encode(bytes)}@{EncodedMarkerLabel}.{mailDomain}";
     }
 
     /// <summary>
     /// Attempts to decode a synthetic addr-spec produced by <see cref="Encode"/> back to the exact
-    /// original packet address.
+    /// canonical (upper-cased) packet address — readable form or base32 escape.
     /// </summary>
     /// <param name="addrSpec">A candidate addr-spec (e.g. from an inbound email To/From header).</param>
     /// <param name="mailDomain">The same synthetic mail domain used to encode.</param>
-    /// <param name="packetAddress">On success, the byte-exact original packet address.</param>
+    /// <param name="packetAddress">On success, the original packet address (canonical upper case).</param>
     /// <returns>
-    /// <c>true</c> if <paramref name="addrSpec"/> is in our scheme and decoded; <c>false</c> for any
-    /// address whose domain is not <paramref name="mailDomain"/> or whose local part is not valid base32
-    /// (a genuine external address).
+    /// <c>true</c> if <paramref name="addrSpec"/> is in our scheme (its domain is <paramref name="mailDomain"/>
+    /// or ends <c>.&lt;mailDomain&gt;</c>) and decoded; <c>false</c> for a genuine external address.
     /// </returns>
     public static bool TryDecode(string? addrSpec, string mailDomain, out string packetAddress)
     {
@@ -104,21 +137,112 @@ public static class PacketAddressCodec
             return false;
         }
 
-        string domain = addrSpec[(at + 1)..];
-        // Strip the domain case-insensitively — it is ours only if it matches the configured domain.
-        if (!string.Equals(domain, mailDomain, StringComparison.OrdinalIgnoreCase))
+        string local = addrSpec[..at];
+        string lowerDomain = addrSpec[(at + 1)..].ToLowerInvariant();
+        string lowerMail = mailDomain.ToLowerInvariant();
+
+        // Bare readable: <call>@<mailDomain>.
+        if (string.Equals(lowerDomain, lowerMail, StringComparison.Ordinal))
+        {
+            string bare = local.ToUpperInvariant();
+            if (!IsLabel(bare))
+            {
+                return false;
+            }
+
+            packetAddress = bare;
+            return true;
+        }
+
+        // Everything else must sit under our domain: <middle>.<mailDomain>.
+        if (!lowerDomain.EndsWith("." + lowerMail, StringComparison.Ordinal))
         {
             return false;
         }
 
-        string localPart = addrSpec[..at];
-        // Tolerate a client that lower-cased the local part: base32 is single-case, so upper-case first.
-        if (!TryBase32Decode(localPart.ToUpperInvariant(), out byte[]? bytes))
+        string middle = lowerDomain[..^(lowerMail.Length + 1)];
+
+        // Base32 escape: <base32>@b32.<mailDomain>.
+        if (string.Equals(middle, EncodedMarkerLabel, StringComparison.Ordinal))
+        {
+            if (!TryBase32Decode(local.ToUpperInvariant(), out byte[]? bytes))
+            {
+                return false;
+            }
+
+            packetAddress = Encoding.UTF8.GetString(bytes);
+            return true;
+        }
+
+        // Readable route: <call>@<gb7rdg.gbr.euro>.<mailDomain> → CALL@GB7RDG.GBR.EURO.
+        string upLocal = local.ToUpperInvariant();
+        string upRoute = middle.ToUpperInvariant();
+        if (!IsLabel(upLocal) || !upRoute.Split('.').All(IsLabel))
         {
             return false;
         }
 
-        packetAddress = Encoding.UTF8.GetString(bytes);
+        packetAddress = $"{upLocal}@{upRoute}";
+        return true;
+    }
+
+    /// <summary>
+    /// Builds the readable addr-spec when every element is a valid domain label, else returns false so
+    /// the caller takes the base32 escape. The local part is the callsign/category; the route (if any)
+    /// becomes lower-case domain labels.
+    /// </summary>
+    private static bool TryReadableForm(string addr, string mailDomain, [NotNullWhen(true)] out string? readable)
+    {
+        readable = null;
+
+        int at = addr.IndexOf('@');
+        string local = at < 0 ? addr : addr[..at];
+        string route = at < 0 ? string.Empty : addr[(at + 1)..];
+
+        if (!IsLabel(local))
+        {
+            return false; // the callsign/category part isn't a clean single label
+        }
+
+        if (route.Length == 0)
+        {
+            readable = $"{local}@{mailDomain}";
+            return true;
+        }
+
+        // Every route element must be a valid DNS label — a '#' area marker fails here → base32 escape.
+        if (!route.Split('.').All(IsLabel))
+        {
+            return false;
+        }
+
+        // Reserved-marker collision guard: a single-label route that equals the encoded marker would
+        // alias the base32 subdomain — push it through base32 instead (vanishingly rare).
+        if (string.Equals(route, EncodedMarkerLabel, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        readable = $"{local}@{route.ToLowerInvariant()}.{mailDomain}";
+        return true;
+    }
+
+    /// <summary>A valid DNS/local label: 1–63 chars of [A-Za-z0-9-], not leading or trailing with a hyphen.</summary>
+    private static bool IsLabel(string s)
+    {
+        if (s.Length is 0 or > 63 || s[0] == '-' || s[^1] == '-')
+        {
+            return false;
+        }
+
+        foreach (char c in s)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-')
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 

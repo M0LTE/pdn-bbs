@@ -7,17 +7,21 @@ public sealed class PacketAddressCodecTests
     private const string MailDomain = "pdn";
 
     [Theory]
-    [InlineData("M0LTE@GB7RDG.#42.GBR.EURO")] // the # case — illegal in a real domain
-    [InlineData("M0LTE")]                       // bare callsign
-    [InlineData("M0LTE-7")]                      // SSID
-    [InlineData("G4ABC@GB7BSK.#23.GBR.EURO")]   // a longer hierarchical route
+    [InlineData("M0LTE@GB7RDG.#42.GBR.EURO")] // the # case — illegal in a real domain (base32 escape)
+    [InlineData("M0LTE")]                       // bare callsign (readable)
+    [InlineData("M0LTE-7")]                      // SSID (readable — hyphen is label-legal)
+    [InlineData("M0LTE@GB7RDG")]                 // simple home-BBS route (readable)
+    [InlineData("M0LTE@GB7RDG.GBR.EURO")]        // full hierarchical route, no hash (readable)
+    [InlineData("G4ABC@GB7BSK.#23.GBR.EURO")]   // a longer hierarchical route (base32 escape)
     [InlineData("ALL")]                          // a bulletin category
     [InlineData("NEWS")]                         // another bulletin category
     public void Decode_OfEncode_RoundTripsByteExact(string packetAddress)
     {
         string addrSpec = PacketAddressCodec.Encode(packetAddress, MailDomain);
 
-        Assert.EndsWith("@" + MailDomain, addrSpec, StringComparison.Ordinal);
+        // Every synthetic addr-spec lives under the mail domain, whether bare (@pdn), a readable
+        // route (.pdn) or the base32 escape (@b32.pdn).
+        Assert.EndsWith(MailDomain, addrSpec, StringComparison.Ordinal);
         Assert.True(PacketAddressCodec.TryDecode(addrSpec, MailDomain, out string decoded));
         Assert.Equal(packetAddress, decoded); // byte-exact (ordinal)
     }
@@ -80,13 +84,15 @@ public sealed class PacketAddressCodecTests
     [Fact]
     public void Encode_At64OctetLocalPartEdge_Succeeds()
     {
-        // 40 octets => exactly 64 base32 chars => exactly the RFC 5321 cap.
-        string longest = new('X', PacketAddressCodec.MaxPacketAddressLength);
+        // 40 octets => exactly 64 base32 chars => exactly the RFC 5321 cap. A leading '#' forces the
+        // base32 escape (the readable path would otherwise accept a long all-letter label).
+        string longest = "#" + new string('X', PacketAddressCodec.MaxPacketAddressLength - 1);
         Assert.Equal(40, longest.Length);
 
         string addrSpec = PacketAddressCodec.Encode(longest, MailDomain);
         string localPart = addrSpec[..addrSpec.LastIndexOf('@')];
         Assert.Equal(PacketAddressCodec.MaxLocalPartLength, localPart.Length); // 64, the cap
+        Assert.EndsWith("@b32." + MailDomain, addrSpec, StringComparison.Ordinal);
 
         Assert.True(PacketAddressCodec.TryDecode(addrSpec, MailDomain, out string decoded));
         Assert.Equal(longest, decoded);
@@ -95,7 +101,8 @@ public sealed class PacketAddressCodecTests
     [Fact]
     public void Encode_OverLongAddress_Throws()
     {
-        string tooLong = new('X', PacketAddressCodec.MaxPacketAddressLength + 1); // 41 octets => 66 base32 chars
+        // 41 octets => 66 base32 chars, over the cap. '#' forces the base32 escape path that checks length.
+        string tooLong = "#" + new string('X', PacketAddressCodec.MaxPacketAddressLength); // 41 octets
 
         ArgumentException ex = Assert.Throws<ArgumentException>(
             () => PacketAddressCodec.Encode(tooLong, MailDomain));
@@ -122,16 +129,21 @@ public sealed class PacketAddressCodecTests
     }
 
     [Fact]
-    public void Example_HashAddress_EncodesToKnownLocalPart()
+    public void Example_HashAddress_EncodesToBase32Escape()
     {
-        // Documents the exact base32 mapping for the headline example (a regression pin).
+        // Documents the exact base32 escape for the headline '#' example (a regression pin):
+        // the whole address goes base32 into the local part, tagged with the reserved b32 subdomain.
         string addrSpec = PacketAddressCodec.Encode("M0LTE@GB7RDG.#42.GBR.EURO", MailDomain);
-        Assert.Equal("JUYEYVCFIBDUEN2SIRDS4IZUGIXEOQSSFZCVKUSP@pdn", addrSpec);
+        Assert.Equal("JUYEYVCFIBDUEN2SIRDS4IZUGIXEOQSSFZCVKUSP@b32.pdn", addrSpec);
     }
 
-    [Fact]
-    public void Example_BareCallsign_EncodesToKnownLocalPart()
+    [Theory]
+    [InlineData("M0LTE", "M0LTE@pdn")]                                  // bare callsign
+    [InlineData("M0LTE@GB7RDG", "M0LTE@gb7rdg.pdn")]                     // simple home-BBS route
+    [InlineData("M0LTE@GB7RDG.GBR.EURO", "M0LTE@gb7rdg.gbr.euro.pdn")]  // full hierarchical route, no hash
+    [InlineData("NEWS", "NEWS@pdn")]                                    // bulletin category
+    public void Example_ReadableAddress_EncodesReadable(string packetAddress, string expected)
     {
-        Assert.Equal("JUYEYVCF@pdn", PacketAddressCodec.Encode("M0LTE", MailDomain));
+        Assert.Equal(expected, PacketAddressCodec.Encode(packetAddress, MailDomain));
     }
 }
