@@ -6,6 +6,7 @@ using Bbs.Host.Forwarding;
 using Bbs.Host.Rhp;
 using Bbs.Host.Sessions;
 using Bbs.Host.Web;
+using Bbs.Imap;
 
 namespace Bbs.Host;
 
@@ -112,6 +113,25 @@ public static class HostComposition
         builder.Services.AddSingleton(sp => new HousekeepingRunner(
             store, new HousekeepingPolicy(), time, sp.GetRequiredService<ILogger<HousekeepingRunner>>()));
 
+        // The optional IMAP server (default off): registered only when enabled, so a node that does
+        // not configure it constructs nothing and behaves exactly as before. The self-signed TLS cert
+        // (if used) persists alongside the db in the state dir.
+        if (config.Imap.Enabled)
+        {
+            var imapOptions = new ImapServerOptions
+            {
+                Bind = config.Imap.Bind,
+                Port = config.Imap.Port,
+                TlsEnabled = config.Imap.Tls.Enabled,
+                CertificatePath = config.Imap.Tls.CertificatePath,
+                CertificatePassword = config.Imap.Tls.CertificatePassword,
+                GenerateSelfSigned = config.Imap.Tls.GenerateSelfSigned,
+                SelfSignedCertPath = Path.Combine(stateDir, "imap-cert.pfx"),
+            };
+            builder.Services.AddSingleton(sp => new ImapServer(
+                imapOptions, store, time, sp.GetRequiredService<ILogger<ImapServer>>()));
+        }
+
         // One ComponentService<T> per component: AddHostedService registers through
         // TryAddEnumerable, which de-duplicates by implementation type — with a single
         // non-generic ComponentService only the FIRST of these four registrations survived,
@@ -126,6 +146,13 @@ public static class HostComposition
             sp.GetRequiredService<ForwardingScheduler>(), static (scheduler, ct) => scheduler.RunAsync(ct)));
         builder.Services.AddHostedService(sp => new ComponentService<HousekeepingRunner>("housekeeping",
             sp.GetRequiredService<HousekeepingRunner>(), static (runner, ct) => runner.RunAsync(ct)));
+
+        // The IMAP accept loop is hosted only when the (default-off) IMAP server was registered above.
+        if (config.Imap.Enabled)
+        {
+            builder.Services.AddHostedService(sp => new ComponentService<ImapServer>("imap",
+                sp.GetRequiredService<ImapServer>(), static (server, ct) => server.RunAsync(ct)));
+        }
 
         WebApplication app = builder.Build();
 

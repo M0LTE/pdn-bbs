@@ -216,5 +216,13 @@ public sealed class ConfigTests : IDisposable
         Assert.Null(config.Rhp.Host);
         Assert.Null(config.Rhp.Port);
         Assert.Equal(18090, config.Web.Port);
+
+        // IMAP is default-off: a node that does not configure it behaves exactly as before.
+        Assert.False(config.Imap.Enabled);
+        Assert.Equal("127.0.0.1", config.Imap.Bind);
+        Assert.Equal(1143, config.Imap.Port);
+        Assert.False(config.Imap.Tls.Enabled);
+        Assert.True(config.Imap.Tls.GenerateSelfSigned);
+        Assert.Null(config.Imap.Tls.CertificatePath);
     }
 }
