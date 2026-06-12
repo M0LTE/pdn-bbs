@@ -374,6 +374,63 @@ public class B2ForwardingTests
         Assert.Equal(MessageStatus.Forwarded, host.Store.GetMessage(stored.Number)!.Status);
     }
 
+    [Fact]
+    public async Task OutboundB2Cycle_LinkDropsBeforeBody_LeavesMessageQueued_NotForwarded()
+    {
+        // The live GB7RDG B2 go-live (2026-06-12) also surfaced this data-loss class: the node
+        // reported the AX.25 session gone ("17 Not connected") when pdn went to push a body that
+        // spanned more than one frame over the half-duplex link (the node-side multi-frame TX is a
+        // separate bug). pdn USED to clear the queue entry on the FS-accept — BEFORE the body was
+        // sent — so the message was lost (marked Forwarded, never delivered, never retried). The
+        // body transfer now precedes its result: a failed body send aborts the action loop before
+        // the mark, so the message stays queued for the next cycle.
+        await using var host = new HostHarness();
+        host.Store.UpsertPartner(new Partner
+        {
+            Call = "GB7BPQ",
+            AllowB2F = true,
+            AtCalls = ["*"],
+            ConnectScript = ["C GB7BPQ-1"],
+            ForwardNewImmediately = true,
+        });
+        await host.StartLinkAsync();
+
+        Message stored = host.Store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "B2 lost body",
+            Body = Encoding.Latin1.GetBytes("B2 body the link drops before we can send.\r"),
+        });
+        host.Routing.RouteMessage(stored);
+
+        Partner partner = host.Store.GetPartner("GB7BPQ")!;
+        IReadOnlyList<OutboundItem> outbound = OutboundBuilder.Build(
+            host.Store.GetForwardQueue("GB7BPQ"), partner, host.Identity, host.Time, NullLogger.Instance);
+
+        RhpChildConnection child = await host.Link.OpenAsync("GB7BPQ-1", null, host.Token);
+        FakeRhpPeer peer = await host.Server.NextOpenAsync();
+        Task<FbbSessionResult> run = host.Runner.RunCallerAsync(child, partner, outbound, host.Token);
+
+        await peer.SendLineAsync(B2PeerSid);
+        await peer.SendTextAsync("de GB7BPQ>\r");
+        Assert.Equal(OurB2Sid, await peer.ReadLineAsync());
+        Assert.StartsWith("FC EM ", await peer.ReadLineAsync(), StringComparison.Ordinal);
+        await peer.ReadLineAsync(); // F> terminator
+
+        // The far end drops BEFORE pdn sends the body: the accept arrives, but the body push fails.
+        peer.MarkDisconnected();
+        await peer.SendLineAsync("FS +");
+
+        // The body send fails and surfaces (not swallowed — it is not a terminal-phase close).
+        await Assert.ThrowsAnyAsync<Exception>(() => run.WaitAsync(TestTimeout.Default));
+
+        // The message was NOT cleared: it stays queued for the next cycle, not silently dropped.
+        Assert.Single(host.Store.GetForwardQueue("GB7BPQ"));
+        Assert.NotEqual(MessageStatus.Forwarded, host.Store.GetMessage(stored.Number)!.Status);
+    }
+
     // --- Named deferral: multi-recipient + attachment B2 (slice 2 scope is single-recipient/no-attachment) ---
 
     [Fact(Skip = "Deferred (slice 2 scope): B2F multi-recipient fan-out (multiple To:/Cc:) and File: "
