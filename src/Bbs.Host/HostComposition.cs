@@ -71,6 +71,9 @@ public static class HostComposition
             BbsCallsign = bindCallsign,
             SysopCallsigns = string.IsNullOrWhiteSpace(config.Sysop) ? [] : [config.Sysop],
             Version = version,
+            // For the plain sysop `route` explain — the same own-call + H-Route the live
+            // RoutingEngine above is built from, so the trace matches real routing.
+            HRoute = config.HRoute,
         };
 
         var linkOptions = new RhpLinkOptions
