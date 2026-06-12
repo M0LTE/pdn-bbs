@@ -52,7 +52,7 @@ public static class PacketAddressCodec
     /// <c>&lt;base32(packetAddress)&gt;@&lt;mailDomain&gt;</c>.
     /// </summary>
     /// <param name="packetAddress">The full packet address, verbatim (e.g. <c>M0LTE@GB7RDG.#42.GBR.EURO</c>).</param>
-    /// <param name="mailDomain">The BBS's synthetic mail domain (e.g. <c>pkt.gb7pdn</c>).</param>
+    /// <param name="mailDomain">The BBS's synthetic mail domain (e.g. <c>pdn</c>).</param>
     /// <returns>An RFC 5322 addr-spec whose local part losslessly carries the whole address.</returns>
     /// <exception cref="ArgumentException">
     /// Thrown when the address is so long its base32 would exceed the 64-octet local-part cap

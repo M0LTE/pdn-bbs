@@ -28,7 +28,7 @@ public static class BbsMessageToMime
     /// Renders <paramref name="message"/> into a <see cref="MimeMessage"/>.
     /// </summary>
     /// <param name="message">The stored BBS message (with its recipients and attachments).</param>
-    /// <param name="mailDomain">The synthetic mail domain (e.g. <c>pkt.gb7pdn</c>) — not hardcoded.</param>
+    /// <param name="mailDomain">The synthetic mail domain (e.g. <c>pdn</c>) — not hardcoded.</param>
     public static MimeMessage ToMimeMessage(Message message, string mailDomain)
     {
         ArgumentNullException.ThrowIfNull(message);

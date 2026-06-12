@@ -4,7 +4,7 @@ namespace Bbs.Mime.Tests;
 
 public sealed class PacketAddressCodecTests
 {
-    private const string MailDomain = "pkt.gb7pdn";
+    private const string MailDomain = "pdn";
 
     [Theory]
     [InlineData("M0LTE@GB7RDG.#42.GBR.EURO")] // the # case — illegal in a real domain
@@ -126,12 +126,12 @@ public sealed class PacketAddressCodecTests
     {
         // Documents the exact base32 mapping for the headline example (a regression pin).
         string addrSpec = PacketAddressCodec.Encode("M0LTE@GB7RDG.#42.GBR.EURO", MailDomain);
-        Assert.Equal("JUYEYVCFIBDUEN2SIRDS4IZUGIXEOQSSFZCVKUSP@pkt.gb7pdn", addrSpec);
+        Assert.Equal("JUYEYVCFIBDUEN2SIRDS4IZUGIXEOQSSFZCVKUSP@pdn", addrSpec);
     }
 
     [Fact]
     public void Example_BareCallsign_EncodesToKnownLocalPart()
     {
-        Assert.Equal("JUYEYVCF@pkt.gb7pdn", PacketAddressCodec.Encode("M0LTE", MailDomain));
+        Assert.Equal("JUYEYVCF@pdn", PacketAddressCodec.Encode("M0LTE", MailDomain));
     }
 }

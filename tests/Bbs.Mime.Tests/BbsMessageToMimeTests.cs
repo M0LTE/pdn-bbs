@@ -7,7 +7,7 @@ namespace Bbs.Mime.Tests;
 
 public sealed class BbsMessageToMimeTests
 {
-    private const string MailDomain = "pkt.gb7pdn";
+    private const string MailDomain = "pdn";
 
     private static Message PersonalWithRecipientsAndAttachment()
     {
@@ -218,7 +218,7 @@ public sealed class BbsMessageToMimeTests
     public void MessageIdFromBid_SanitisesNonTokenCharacters()
     {
         // A BID with a space (pathological) is sanitised to a valid msg-id token.
-        Assert.Equal("3331.GM8BPQ@pkt.gb7pdn",
+        Assert.Equal("3331.GM8BPQ@pdn",
             BbsMessageToMime.MessageIdFromBid("3331 GM8BPQ", MailDomain));
     }
 
