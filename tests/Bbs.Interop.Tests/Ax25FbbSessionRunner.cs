@@ -10,11 +10,23 @@ namespace Bbs.Interop.Tests;
 /// <param name="Graceful">The FF/FQ close (spec §3.1 step 5) was reached.</param>
 /// <param name="Verdicts">The peer's FS verdict per store message number we proposed.</param>
 /// <param name="ProtocolErrors">Any <c>*** …</c> failures surfaced by the FSM.</param>
+/// <param name="B2Active">
+/// Whether B2F (FC) was negotiated for this session — our offer ∩ the peer's SID (spec §3.2/§3.9).
+/// The oracle-check evidence that FC/B2, not FA/B1, was on the wire.
+/// </param>
+/// <param name="PeerSidRaw">The peer's SID exactly as received (the live LinBPQ SID, terminator stripped).</param>
+/// <param name="InboundProposals">
+/// Every proposal the peer offered us, in arrival order — the inbound-direction wire evidence:
+/// an <see cref="FcProposal"/> here proves the oracle proposed FC/B2 (not a silent FA/B1).
+/// </param>
 internal sealed record InteropFbbResult(
     bool Completed,
     bool Graceful,
     IReadOnlyDictionary<long, FsAnswerKind> Verdicts,
-    IReadOnlyList<string> ProtocolErrors);
+    IReadOnlyList<string> ProtocolErrors,
+    bool B2Active,
+    string? PeerSidRaw,
+    IReadOnlyList<Proposal> InboundProposals);
 
 /// <summary>
 /// Drives a sans-IO <see cref="FbbSession"/> over an <see cref="Ax25ByteSession"/>, both
@@ -92,6 +104,13 @@ internal sealed class Ax25FbbSessionRunner
                 Role = role,
                 OwnCallsign = _identity.Callsign,
                 SidVersion = _sidVersion,
+
+                // B2F is opt-in per partner (default off → B1 unchanged), mirroring the W5
+                // FbbSessionRunner: when set we advertise '2' in our SID and the session
+                // activates B2 only if the peer's SID also advertises it (B2Active = our
+                // offer ∩ the peer SID — spec §3.2/§3.9). An unknown caller (no partner
+                // record) is never B2-allowed, so its FC would be refused.
+                OfferB2 = partner?.AllowB2F ?? false,
             },
             outbound.Select(o => o.Wire));
 
@@ -120,20 +139,26 @@ internal sealed class Ax25FbbSessionRunner
                 }
                 catch (OperationCanceledException) when (idle.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
-                    return new InteropFbbResult(Completed: false, Graceful: false, state.Verdicts, state.Errors);
+                    return new InteropFbbResult(
+                        Completed: false, Graceful: false, state.Verdicts, state.Errors,
+                        session.B2Active, session.PeerSid?.Raw, state.InboundProposals);
                 }
             }
 
             if (data is null)
             {
-                return new InteropFbbResult(Completed: false, Graceful: false, state.Verdicts, state.Errors);
+                return new InteropFbbResult(
+                    Completed: false, Graceful: false, state.Verdicts, state.Errors,
+                    session.B2Active, session.PeerSid?.Raw, state.InboundProposals);
             }
 
             await ApplyAsync(session.Advance(new FbbPeerData(data)), session, link, state, cancellationToken)
                 .ConfigureAwait(false);
         }
 
-        return new InteropFbbResult(Completed: true, state.Graceful, state.Verdicts, state.Errors);
+        return new InteropFbbResult(
+            Completed: true, state.Graceful, state.Verdicts, state.Errors,
+            session.B2Active, session.PeerSid?.Raw, state.InboundProposals);
     }
 
     private async Task ApplyAsync(
@@ -159,6 +184,7 @@ internal sealed class Ax25FbbSessionRunner
                     break;
 
                 case FbbProposalsReceived proposals:
+                    state.InboundProposals.AddRange(proposals.Proposals);
                     IReadOnlyList<FsAnswer> answers = _receiver.Decide(proposals.Proposals, state.Partner);
                     foreach (FbbAction next in session.Advance(new FbbProposalDecisions(answers)))
                     {
@@ -227,6 +253,8 @@ internal sealed class Ax25FbbSessionRunner
         public Dictionary<long, FsAnswerKind> Verdicts { get; } = [];
 
         public List<string> Errors { get; } = [];
+
+        public List<Proposal> InboundProposals { get; } = [];
 
         public bool Over { get; set; }
 
