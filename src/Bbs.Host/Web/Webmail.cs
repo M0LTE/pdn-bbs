@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using Bbs.Core;
+using Bbs.SevenPlus;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 
@@ -24,6 +25,15 @@ public sealed record WebmailOptions
 
     /// <summary>Rows per page on the inbox/bulletins lists.</summary>
     public int PageSize { get; init; } = 25;
+
+    /// <summary>
+    /// Max accepted compose-upload size in bytes (the send-side file slice). A sane ceiling so a
+    /// stray huge upload is rejected cleanly rather than encoded/stored — not the partner MaxTx (a
+    /// composed file routes/forwards as a normal message and 7plus-encoding expands it ~12%, so the
+    /// per-partner cap is enforced downstream in <see cref="Bbs.Host.Forwarding.OutboundBuilder"/>).
+    /// Default 256 KiB.
+    /// </summary>
+    public int MaxUploadBytes { get; init; } = 256 * 1024;
 }
 
 /// <summary>
@@ -99,8 +109,15 @@ public static class Webmail
                 return Results.Redirect(U(prefix, "/"));
             }
 
+            // ReadFormAsync transparently parses BOTH application/x-www-form-urlencoded (the legacy
+            // no-file case) and multipart/form-data (the file-upload case): text fields land in
+            // form[...] and an uploaded file in form.Files. The pdn app-gateway reverse-proxies the
+            // raw request body to our loopback upstream (manifest ui.upstream) with the Content-Type
+            // intact, so multipart flows through unmodified — there is no body rewrite or size cap in
+            // the gateway/app-package wiring (pdn carries zero BBS-specific code). We cap the upload
+            // ourselves below (WebmailOptions.MaxUploadBytes) rather than relying on a gateway limit.
             IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
-            return Compose(options, prefix, call, form);
+            return Compose(options, prefix, call, form, form.Files.GetFile("file"));
         });
 
         app.MapPost("/messages/{number:long}/kill", (HttpContext ctx, long number) => WithCallsign(ctx, options,
@@ -319,13 +336,23 @@ public static class Webmail
         return sb.Length == 0 ? "attachment" : sb.ToString();
     }
 
-    private static IResult ComposeForm(WebmailOptions o, string prefix, string call, string? to, string? type)
+    private static IResult ComposeForm(
+        WebmailOptions o, string prefix, string call, string? to, string? type,
+        string? error = null, int status = StatusCodes.Status200OK)
     {
         bool bulletin = string.Equals(type, "B", StringComparison.OrdinalIgnoreCase);
+        string err = error is null ? "" : $"""<p class="err">{H(error)}</p>""";
+
+        // The file-handling choice (the send-side file slice): attach a file and pick how it travels.
+        // 7plus is the UNIVERSAL choice (the parts ride in the body text over any path — B1 or B2, and
+        // even a text-only TNC2 link); a binary B2 attachment only reaches B2-capable partners. The
+        // form posts multipart/form-data so Request.Form.Files surfaces the upload; with no file the
+        // mode is ignored, so the dominant no-file case is unchanged behaviour.
         return Html(Page(o, prefix, call, "Compose",
             $"""
             <h2>Compose</h2>
-            <form method="post" action="{U(prefix, "/compose")}">
+            {err}
+            <form method="post" action="{U(prefix, "/compose")}" enctype="multipart/form-data">
             <p><label>Type
             <select name="type">
             <option value="P"{(bulletin ? "" : " selected")}>Personal</option>
@@ -335,12 +362,17 @@ public static class Webmail
             <label>@ <input name="at" placeholder="route, e.g. GB7BPQ.#23.GBR.EURO or EURO"></label></p>
             <p><label>Subject <input name="subject" size="60" maxlength="60" required></label></p>
             <p><textarea name="body" rows="12" cols="72"></textarea></p>
+            <fieldset><legend>Attach a file <span class="dim">(optional)</span></legend>
+            <p><input type="file" name="file"></p>
+            <p><label><input type="radio" name="fileMode" value="7plus" checked> 7plus-encode it <span class="dim">— universal: the encoded text rides in the message body and reaches any partner (and a TNC2 user)</span></label></p>
+            <p><label><input type="radio" name="fileMode" value="attachment"> Send as a binary attachment <span class="dim">— only reaches B2-capable partners; 7plus is the universal choice</span></label></p>
+            </fieldset>
             <p><button type="submit">Send</button></p>
             </form>
-            """));
+            """), status);
     }
 
-    private static IResult Compose(WebmailOptions o, string prefix, string call, IFormCollection form)
+    private static IResult Compose(WebmailOptions o, string prefix, string call, IFormCollection form, IFormFile? file)
     {
         string typeField = form["type"].ToString().Trim().ToUpperInvariant();
         MessageType type = typeField == "B" ? MessageType.Bulletin : MessageType.Personal;
@@ -351,9 +383,7 @@ public static class Webmail
 
         if (to.Length == 0 || subject.Length == 0)
         {
-            return Html(Page(o, prefix, call, "Compose",
-                $"""<h2>Compose</h2><p class="err">TO and Subject are required.</p><p><a href="{U(prefix, "/compose")}">Back</a></p>"""),
-                StatusCodes.Status400BadRequest);
+            return ComposeForm(o, prefix, call, to, typeField, "TO and Subject are required.", StatusCodes.Status400BadRequest);
         }
 
         // `call@route` in the TO box works like the console's S-line grammar (§1.5).
@@ -367,9 +397,7 @@ public static class Webmail
         string[] recipients = to.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (recipients.Length == 0)
         {
-            return Html(Page(o, prefix, call, "Compose",
-                $"""<h2>Compose</h2><p class="err">TO is required.</p><p><a href="{U(prefix, "/compose")}">Back</a></p>"""),
-                StatusCodes.Status400BadRequest);
+            return ComposeForm(o, prefix, call, to, typeField, "TO is required.", StatusCodes.Status400BadRequest);
         }
 
         // CR line discipline, like the console's body loop stores it (§1.5 step 6).
@@ -377,6 +405,58 @@ public static class Webmail
         if (crBody.Length > 0 && !crBody.EndsWith('\r'))
         {
             crBody += "\r";
+        }
+
+        // The send-side file slice: an uploaded file (when present) either 7plus-encodes into the body
+        // text (universal — survives B1/text-only paths; an inbound SevenPlusAssembler reassembles it
+        // at a pdn recipient) or rides as a binary B2 attachment. With no file, both lists below stay
+        // empty and the path is exactly the prior text-only compose.
+        var attachments = new List<MessageAttachment>();
+        if (file is { Length: > 0 })
+        {
+            if (file.Length > o.MaxUploadBytes)
+            {
+                return ComposeForm(o, prefix, call, to, typeField,
+                    Inv($"That file is too large ({file.Length} bytes); the limit is {o.MaxUploadBytes} bytes."),
+                    StatusCodes.Status400BadRequest);
+            }
+
+            // Path components are stripped so the stored/encoded name is a bare filename.
+            string fileName = StripUploadPath(file.FileName);
+            byte[] bytes = ReadAll(file, o.MaxUploadBytes);
+
+            string mode = form["fileMode"].ToString().Trim().ToLowerInvariant();
+            if (mode == "attachment")
+            {
+                // Rides the attachments plumbing; BuildB2Object emits it as a B2 File: part.
+                attachments.Add(new MessageAttachment(fileName, bytes));
+            }
+            else
+            {
+                // 7plus (the default): append the encoded parts after the user's text, blank-separated.
+                // The codec handles the DOS-8.3 + extended long-name lines; we just give it the real
+                // name. A large file yields multiple parts regardless (the codec's 512-line/part cap) —
+                // MVP embeds them all in one body (the multi-frame-TX node fix forwards large bodies).
+                //
+                // The parts are appended VERBATIM (their wire-faithful CRLF separators), NOT run through
+                // the body's CR line discipline: a 7plus code line can legitimately contain byte 0x85,
+                // which string.ReplaceLineEndings treats as a Unicode line break (U+0085 NEL) and would
+                // rewrite — corrupting the line and breaking reassembly. CRLF is the codec default and
+                // the inbound scanner tolerates CRLF/CR/LF, so verbatim is both correct and round-trips.
+                IReadOnlyList<string> parts = SevenPlusEncoder.Encode(bytes, fileName);
+                var sb = new StringBuilder(crBody);
+                if (sb.Length > 0)
+                {
+                    sb.Append('\r'); // a blank line between the user's text and the 7plus block
+                }
+
+                foreach (string part in parts)
+                {
+                    sb.Append(part);
+                }
+
+                crBody = sb.ToString();
+            }
         }
 
         Message stored = o.Store.AddMessage(new MessageDraft
@@ -387,9 +467,27 @@ public static class Webmail
             At = at.Length == 0 ? null : at,
             Subject = subject,
             Body = Encoding.Latin1.GetBytes(crBody),
+            Attachments = attachments,
         });
         o.Routing.RouteMessage(stored);
         return Results.Redirect(U(prefix, Inv($"/messages/{stored.Number}")));
+    }
+
+    /// <summary>Strips any directory component from an uploaded filename (both '/' and '\'), defending against a traversal-shaped name.</summary>
+    private static string StripUploadPath(string name)
+    {
+        int slash = Math.Max(name.LastIndexOf('/'), name.LastIndexOf('\\'));
+        string bare = (slash >= 0 ? name[(slash + 1)..] : name).Trim();
+        return bare.Length == 0 ? "upload.bin" : bare;
+    }
+
+    /// <summary>Reads the uploaded file into a byte array, bounded by <paramref name="cap"/> (the size guard is enforced by the caller first).</summary>
+    private static byte[] ReadAll(IFormFile file, int cap)
+    {
+        using var ms = new MemoryStream(checked((int)Math.Min(file.Length, cap)));
+        using Stream stream = file.OpenReadStream();
+        stream.CopyTo(ms);
+        return ms.ToArray();
     }
 
     private static IResult Kill(WebmailOptions o, string prefix, string call, long number)
