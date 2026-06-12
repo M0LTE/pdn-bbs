@@ -4,19 +4,18 @@
 #
 # The tight build -> deploy -> show loop for the BBS app package, bypassing
 # CI/GHA but using the SAME packaging as the release: build the amd64 .deb with
-# scripts/build-deb.sh (PDN_FAST=1), scp it to the box, `dpkg -i` it, MIGRATE off
-# any old hand-staged code, restart the packetnet node, then print a liveness
-# summary (service state, /healthz, the bbs app starting in the journal, and the
-# preserved message count) so you can see it came up with its data intact.
+# scripts/build-deb.sh (PDN_FAST=1), scp it to the box, `dpkg -i` it, restart the
+# packetnet node, then print a liveness summary (service state, /healthz, the bbs
+# app starting in the journal, and the preserved message count) so you can see it
+# came up with its data intact.
 #
 # CODE vs STATE (docs/release-pipeline.md): the .deb installs CODE to the SYSTEM
 # app dir /usr/share/packetnet/apps/bbs. STATE (bbs.db, bbs.yaml) lives in the
 # OWNER app-state dir /var/lib/packetnet/apps/bbs. The packetnet node discovers
-# apps by scanning BOTH roots, and LATER ROOT WINS on id collision — so an old
-# hand-staged copy of the CODE under /var/lib would shadow the freshly installed
-# /usr/share copy forever. The MIGRATE step below strips that old /var/lib code
-# (binary + manifest only) so /usr/share becomes authoritative, while KEEPING
-# bbs.db, bbs.yaml and any *.db-wal/-shm sidecars.
+# apps by scanning BOTH roots, and LATER ROOT WINS on id collision — so the box
+# must not also carry a hand-staged copy of the CODE under /var/lib (it would
+# shadow this /usr/share install). This script only installs CODE under
+# /usr/share; STATE under /var/lib is never read or written here.
 #
 # Default target is root@packetdotnet (Ubuntu/systemd LXC on the LAN); the
 # packetnet node host package owns the service + the packetnet user there.
@@ -30,7 +29,7 @@ SERVICE="${PDNBBS_SERVICE:-packetnet}"
 HTTP_PORT="${PDNBBS_HTTP_PORT:-8080}"
 RID="linux-x64"
 ARCH="amd64"
-# State dir on the box (owner-installed app state — code is migrated OUT of here).
+# State dir on the box (owner app-state — code lives under /usr/share, not here).
 STATE_DIR="${PDNBBS_STATE_DIR:-/var/lib/packetnet/apps/bbs}"
 # A dev version that's distinct per build and sorts ABOVE the last release (the
 # +dev<timestamp> build-metadata segment makes `dpkg --compare-versions` rank it
@@ -44,8 +43,7 @@ usage() {
 deploy-bbs.sh — build a real pdn-bbs .deb and install it on the live box.
 
 Builds the amd64 .deb with scripts/build-deb.sh (PDN_FAST=1), scp's it to the
-deploy box, dpkg-installs it, migrates off any old hand-staged /var/lib code so
-the /usr/share copy wins, restarts the packetnet node, and prints a liveness
+deploy box, dpkg-installs it, restarts the packetnet node, and prints a liveness
 summary (service state, /healthz, the bbs app in the journal, preserved message
 count). The tight build->deploy->show dev loop, no CI wait — same artifact shape
 GHA ships.
@@ -112,31 +110,16 @@ fi
 rm -f "/tmp/$deb"
 REMOTE
 
-# --- 3. MIGRATE off old hand-staged code -----------------------------------
-# Strip the old hand-staged CODE from /var/lib so /usr/share wins (later-root-
-# wins, so an old /var/lib binary/manifest would shadow the new install). KEEP
-# bbs.db, bbs.yaml and any *.db-wal/-shm. Idempotent: a clean box (no old code)
-# is a no-op. We touch ONLY the two code files by exact name — never a glob over
-# state.
-say "Migrating: strip old hand-staged code from $STATE_DIR (keep db/yaml)"
-"${SSH[@]}" "$HOST" bash -s "$STATE_DIR" <<'REMOTE'
-set -e
-dir="$1"
-rm -f "$dir/pdn-bbs" "$dir/pdn-app.yaml"
-echo "remaining state in $dir:"
-ls -la "$dir" 2>/dev/null || echo "(state dir does not exist yet — fresh install)"
-REMOTE
-
-# --- 4. Restart -------------------------------------------------------------
+# --- 3. Restart -------------------------------------------------------------
 # The pdn-bbs postinst deliberately does NOT restart packetnet (it only ships
 # the app code); the node re-scans its app dirs on (re)start, so bounce it here.
 say "Restarting $SERVICE"
 "${SSH[@]}" "$HOST" "systemctl restart $SERVICE"
 
-# --- 5. Verify --------------------------------------------------------------
+# --- 4. Verify --------------------------------------------------------------
 # Service active; /healthz answers (poll — Kestrel binds a beat after the unit
 # goes active); the bbs app started in the journal; and the message count is
-# preserved (proves the migrate kept the db). No sqlite3 CLI on the box — use
+# preserved (the .deb never touches /var/lib state). No sqlite3 CLI on the box — use
 # python3. No curl on the box either — probe /healthz with bash's /dev/tcp.
 say "Verifying"
 "${SSH[@]}" "$HOST" bash -s "$SERVICE" "$HTTP_PORT" "$STATE_DIR" <<'REMOTE' || true

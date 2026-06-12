@@ -44,11 +44,11 @@ The `.deb` **never** ships `bbs.yaml` or `bbs.db`, and they are **not** listed a
 
 The `postinst` only prepares the state dir (`install -d -o packetnet -g packetnet -m 0750 /var/lib/packetnet/apps/bbs`) **if the `packetnet` user exists** — the node host package owns that user, and the BBS is a soft `Recommends: packetnet`, so on a standalone install the user may be absent. pdn creates the per-app state dir at runtime anyway, so an absent dir here is harmless. The `postinst` is idempotent and deliberately does **not** restart the packetnet service.
 
-## Why the deploy script strips `/var/lib` code (later-root-wins)
+## Don't leave hand-staged code under `/var/lib` (later-root-wins)
 
-When the node finds the same app `id` under both roots, **the later root wins** — `/var/lib` overrides `/usr/share`. That's the right rule for an owner who wants to override a bundled app, but it's a trap during the migration off the old hand-staged layout: before this pipeline, the BBS binary + manifest were hand-copied into `/var/lib/packetnet/apps/bbs/`. If we now install fresh code under `/usr/share` but leave the old code under `/var/lib`, the node keeps running the **stale** `/var/lib` copy forever.
+When the node finds the same app `id` under both roots, **the later root wins** — `/var/lib` overrides `/usr/share`. That's the right rule for an owner who wants to override a bundled app, but it's a trap if a box still has the *old hand-staged* layout: before this pipeline the BBS binary + manifest were hand-copied into `/var/lib/packetnet/apps/bbs/`, and if fresh code is installed under `/usr/share` while the old code lingers under `/var/lib`, the node keeps running the **stale** `/var/lib` copy forever.
 
-So `scripts/deploy-bbs.sh` performs a one-time-but-idempotent **migrate** step after installing the `.deb`: it `rm -f`s exactly `pdn-bbs` and `pdn-app.yaml` from `/var/lib/packetnet/apps/bbs/` (by exact name — never a glob), while **keeping** `bbs.db`, `bbs.yaml`, and any `*.db-wal`/`*.db-shm`. Once the old code is gone, `/usr/share` is authoritative and every future `.deb` upgrades the code in place. On a clean box the migrate step is a no-op.
+Neither the `.deb` nor `scripts/deploy-bbs.sh` touches `/var/lib` — they only install code under `/usr/share`, and `/var/lib` is left entirely to state (`bbs.db`, `bbs.yaml`, `*.db-wal`/`*.db-shm`). The one box that had the old hand-staged layout (the lab) was migrated off it **once, by hand**: strip exactly `pdn-bbs` + `pdn-app.yaml` from `/var/lib/packetnet/apps/bbs/`, keep the state. After that `/usr/share` is authoritative and every future `.deb` upgrades the code in place. (This is a one-off, not codified — a normal install is `/usr/share`-only from the start.)
 
 ## The two entry points
 
@@ -65,12 +65,12 @@ git tag v0.1.0 && git push origin v0.1.0      # → builds amd64/arm64/armhf, cu
 The tight build → deploy → show loop against the live lab box (`root@packetdotnet`), no CI wait, same artifact shape GHA ships:
 
 ```
-scripts/deploy-bbs.sh            # build amd64 (PDN_FAST=1), scp, dpkg -i, migrate, restart, verify
+scripts/deploy-bbs.sh            # build amd64 (PDN_FAST=1), scp, dpkg -i, restart, verify
 scripts/deploy-bbs.sh --logs     # …then follow the journal
 scripts/deploy-bbs.sh --skip-build   # redeploy the most recent existing .deb
 ```
 
-It builds with `PDN_FAST=1`, which is the named dev-loop seam — it skips nothing critical (single-file + the bundled sqlite lib stay on, or the app won't start). After install + migrate it restarts the packetnet node and prints a liveness summary: service active, `/healthz`, the bbs app starting in the journal, and the **preserved message count** (read via `python3`'s `sqlite3` — there's no `sqlite3` CLI on the box).
+It builds with `PDN_FAST=1`, which is the named dev-loop seam — it skips nothing critical (single-file + the bundled sqlite lib stay on, or the app won't start). After install it restarts the packetnet node and prints a liveness summary: service active, `/healthz`, the bbs app starting in the journal, and the **preserved message count** (read via `python3`'s `sqlite3` — there's no `sqlite3` CLI on the box).
 
 ## Manual one-arch build
 
