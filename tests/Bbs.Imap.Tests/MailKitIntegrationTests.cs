@@ -350,4 +350,49 @@ public sealed class MailKitIntegrationTests
 
         await client.DisconnectAsync(quit: true);
     }
+
+    [Fact]
+    public async Task IdleIsAdvertised_AndNewMailIsPushedLiveWhileIdling()
+    {
+        // The durable iPhone-Mail fix (RFC 2177): the server advertises IDLE, and a client parked on
+        // INBOX in IDLE is *pushed* a fresh EXISTS the instant mail arrives — instead of waiting for
+        // iOS's own slow scheduled fetch. A short poll interval keeps the test fast.
+        using var test = new TestStore();
+        test.Store.SetMailPassword("M0LTE", "passphrase twelve");
+        test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "first"));
+        await using ImapServerHarness harness = await ImapServerHarness.StartAsync(
+            test.Store, test.Time, idlePollInterval: TimeSpan.FromMilliseconds(100));
+
+        using ImapClient client = await harness.ConnectAsync();
+        await client.AuthenticateAsync("M0LTE", "passphrase twelve");
+        Assert.True(client.Capabilities.HasFlag(ImapCapabilities.Idle)); // so iOS uses push, not polling
+        await client.Inbox.OpenAsync(FolderAccess.ReadOnly);
+        Assert.Equal(1, client.Inbox.Count);
+
+        var pushed = new TaskCompletionSource();
+        client.Inbox.CountChanged += (_, _) =>
+        {
+            if (client.Inbox.Count >= 2)
+            {
+                pushed.TrySetResult();
+            }
+        };
+
+        using var done = new CancellationTokenSource();
+        Task idle = client.IdleAsync(done.Token);
+
+        // Mail arrives while the client is parked in IDLE — the poll loop must push the new EXISTS.
+        test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "second"));
+
+        await pushed.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(2, client.Inbox.Count);
+
+        await done.CancelAsync();
+        await idle;
+
+        IList<IMessageSummary> idled = await client.Inbox.FetchAsync(0, -1, MessageSummaryItems.Envelope);
+        Assert.Contains(idled, s => s.Envelope?.Subject == "second");
+
+        await client.DisconnectAsync(quit: true);
+    }
 }

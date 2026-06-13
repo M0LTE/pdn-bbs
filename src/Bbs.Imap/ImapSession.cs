@@ -8,16 +8,24 @@ namespace Bbs.Imap;
 /// Selected) and command dispatch over an <see cref="ImapConnection"/>, backed by an
 /// <see cref="ImapBackend"/>. Read-mostly MVP per RFC 3501 — enough for iPhone Mail and MailKit to
 /// read packet mail end to end: CAPABILITY, LOGIN/AUTHENTICATE PLAIN, LIST/LSUB/STATUS,
-/// SELECT/EXAMINE, FETCH/UID FETCH, STORE/UID STORE (<c>\Seen</c>), NOOP/CHECK/CLOSE/LOGOUT/EXPUNGE.
-/// SEARCH and IDLE are out of scope for this slice.
+/// SELECT/EXAMINE, FETCH/UID FETCH, STORE/UID STORE (<c>\Seen</c>), SEARCH/UID SEARCH,
+/// NOOP/CHECK/CLOSE/LOGOUT/EXPUNGE, and IDLE (RFC 2177 — live new-mail push for iPhone Mail).
 /// </summary>
 public sealed class ImapSession
 {
-    /// <summary>The capability list advertised in the greeting and by <c>CAPABILITY</c>.</summary>
-    public const string Capabilities = "IMAP4rev1 AUTH=PLAIN";
+    /// <summary>
+    /// The capability list advertised in the greeting and by <c>CAPABILITY</c>. <c>IDLE</c> (RFC 2177)
+    /// tells iPhone Mail it can hold the connection open and be pushed new-mail notifications, instead
+    /// of falling back to its slow scheduled fetch.
+    /// </summary>
+    public const string Capabilities = "IMAP4rev1 AUTH=PLAIN IDLE";
+
+    /// <summary>The ceiling on a single IDLE before the server ends it (RFC 2177's ~29-minute note).</summary>
+    private static readonly TimeSpan MaxIdleDuration = TimeSpan.FromMinutes(29);
 
     private readonly ImapConnection _connection;
     private readonly ImapBackend _backend;
+    private readonly TimeSpan _idlePollInterval;
 
     private string? _callsign;
     private ImapMailbox? _mailbox;
@@ -25,12 +33,16 @@ public sealed class ImapSession
     private bool _loggedOut;
 
     /// <summary>Creates a session over <paramref name="connection"/> backed by <paramref name="backend"/>.</summary>
-    public ImapSession(ImapConnection connection, ImapBackend backend)
+    /// <param name="connection">The line-and-literal transport.</param>
+    /// <param name="backend">The store-facing backend.</param>
+    /// <param name="idlePollInterval">How often an IDLE-ing session re-checks for new mail; default 5s.</param>
+    public ImapSession(ImapConnection connection, ImapBackend backend, TimeSpan? idlePollInterval = null)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(backend);
         _connection = connection;
         _backend = backend;
+        _idlePollInterval = idlePollInterval is { } i && i > TimeSpan.Zero ? i : TimeSpan.FromSeconds(5);
     }
 
     /// <summary>
@@ -93,6 +105,9 @@ public sealed class ImapSession
             case "NOOP":
                 await ReportNewMailAsync(cancellationToken).ConfigureAwait(false);
                 await Tagged(tag, "OK", "NOOP completed", cancellationToken).ConfigureAwait(false);
+                break;
+            case "IDLE":
+                await HandleIdleAsync(tag, cancellationToken).ConfigureAwait(false);
                 break;
             case "LOGOUT":
                 await _connection.WriteAsync("* BYE pdn-bbs signing off\r\n", cancellationToken).ConfigureAwait(false);
@@ -697,6 +712,85 @@ public sealed class ImapSession
         {
             await _connection.WriteAsync($"* {_mailbox.Count} EXISTS\r\n", cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// <c>IDLE</c> (RFC 2177): the client parks on the selected mailbox and the server pushes untagged
+    /// updates until the client sends <c>DONE</c>. We answer the continuation (<c>+ idling</c>), then a
+    /// single pending read waits for <c>DONE</c> while a poll loop re-checks the folder every
+    /// <see cref="_idlePollInterval"/> and emits a fresh <c>* n EXISTS</c> whenever mail has arrived
+    /// (the same new-mail check as NOOP). This is what lets iPhone Mail receive new packet mail live
+    /// rather than on its own slow fetch schedule. One reader + one writer on a duplex stream is safe,
+    /// and <c>DONE</c> carries no literal so the reader never writes a continuation. A
+    /// <see cref="MaxIdleDuration"/> ceiling bounds a half-open mobile connection that never sends DONE.
+    /// </summary>
+    private async Task HandleIdleAsync(string tag, CancellationToken cancellationToken)
+    {
+        if (_mailbox is null)
+        {
+            await Tagged(tag, "BAD", "No mailbox selected", cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await _connection.WriteAsync("+ idling\r\n", cancellationToken).ConfigureAwait(false);
+
+        using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Task<string?> readTask = _connection.ReadCommandAsync(idleCts.Token);
+
+        long maxTicks = Math.Max(1, (long)(MaxIdleDuration / _idlePollInterval));
+        long ticks = 0;
+        bool timedOut = false;
+        try
+        {
+            while (true)
+            {
+                Task tick = Task.Delay(_idlePollInterval, idleCts.Token);
+                Task finished = await Task.WhenAny(readTask, tick).ConfigureAwait(false);
+                if (finished == readTask)
+                {
+                    break; // the client sent a line (DONE) or closed the connection
+                }
+
+                await ReportNewMailAsync(cancellationToken).ConfigureAwait(false);
+                if (++ticks >= maxTicks)
+                {
+                    timedOut = true;
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            idleCts.Cancel(); // unblock the pending read and any in-flight delay
+        }
+
+        // Observe the read exactly once (it completed with DONE, or was cancelled by the lines above).
+        string? line;
+        try
+        {
+            line = await readTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            line = null;
+        }
+
+        if (timedOut)
+        {
+            await _connection.WriteAsync("* BYE Idle timeout\r\n", cancellationToken).ConfigureAwait(false);
+            await Tagged(tag, "OK", "IDLE terminated", cancellationToken).ConfigureAwait(false);
+            _loggedOut = true;
+            return;
+        }
+
+        if (line is null)
+        {
+            _loggedOut = true; // the client closed the connection during IDLE
+            return;
+        }
+
+        // RFC 2177: the only valid continuation is DONE; we end IDLE on any line and report OK.
+        await Tagged(tag, "OK", "IDLE completed", cancellationToken).ConfigureAwait(false);
     }
 
     private async Task RequireSelected(string tag, string okText, CancellationToken cancellationToken)
