@@ -104,14 +104,30 @@ public sealed partial class ImapServer
                 if (_options.TlsEnabled && _certificate is not null)
                 {
                     ssl = new SslStream(networkStream, leaveInnerStreamOpen: false);
-                    await ssl.AuthenticateAsServerAsync(
-                        new SslServerAuthenticationOptions
-                        {
-                            ServerCertificate = _certificate,
-                            ClientCertificateRequired = false,
-                            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                        },
-                        cancellationToken).ConfigureAwait(false);
+
+                    // Bound the handshake: a peer that completes the TCP connect but never sends a TLS
+                    // ClientHello (a plaintext/STARTTLS client mis-pointed at this implicit-TLS port — e.g.
+                    // an iOS Mail account-verify probe) would otherwise leave both sides waiting forever
+                    // (ESTABLISHED, 0 bytes). Fail fast and close so the client moves on, never deadlock.
+                    using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    handshakeCts.CancelAfter(_options.TlsHandshakeTimeout);
+                    try
+                    {
+                        await ssl.AuthenticateAsServerAsync(
+                            new SslServerAuthenticationOptions
+                            {
+                                ServerCertificate = _certificate,
+                                ClientCertificateRequired = false,
+                                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                            },
+                            handshakeCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (handshakeCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                    {
+                        LogTlsHandshakeTimeout(_logger);
+                        return;
+                    }
+
                     stream = ssl;
                 }
 
@@ -145,6 +161,9 @@ public sealed partial class ImapServer
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "IMAP connection ended with an I/O fault")]
     private static partial void LogConnectionFault(ILogger logger, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "IMAP: a connection completed TCP but did not start TLS within the handshake timeout; closing (a client not configured for implicit SSL).")]
+    private static partial void LogTlsHandshakeTimeout(ILogger logger);
 }
 
 /// <summary>
@@ -180,4 +199,11 @@ public sealed record ImapServerOptions
     /// store read per interval; tests inject a small value.
     /// </summary>
     public TimeSpan IdlePollInterval { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long to wait for a TLS ClientHello before closing a connection that completed TCP but never
+    /// started the handshake (a plaintext/STARTTLS client mis-pointed at the implicit-TLS port). Bounds
+    /// the deadlock to a fast close instead of an indefinite hang.
+    /// </summary>
+    public TimeSpan TlsHandshakeTimeout { get; init; } = TimeSpan.FromSeconds(10);
 }
