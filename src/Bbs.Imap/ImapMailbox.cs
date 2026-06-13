@@ -13,17 +13,17 @@ namespace Bbs.Imap;
 public sealed class ImapMailbox
 {
     private readonly List<ImapMessageHandle> _handles;
-    private readonly BbsStore _store;
+    private readonly ImapBackend _backend;
 
     /// <summary>Creates the snapshot. <paramref name="handles"/> are in ascending sequence-number order.</summary>
     internal ImapMailbox(
-        ImapFolder folder, string callsign, IReadOnlyList<ImapMessageHandle> handles, uint uidNext, BbsStore store)
+        ImapFolder folder, string callsign, IReadOnlyList<ImapMessageHandle> handles, uint uidNext, ImapBackend backend)
     {
         Folder = folder;
         Callsign = callsign;
         _handles = [.. handles];
         UidNext = uidNext;
-        _store = store;
+        _backend = backend;
     }
 
     /// <summary>The folder this snapshot is of.</summary>
@@ -38,8 +38,8 @@ public sealed class ImapMailbox
     /// <summary>The number of messages — the <c>* n EXISTS</c> count (RFC 3501 §7.3.1).</summary>
     public int Count => _handles.Count;
 
-    /// <summary>UIDNEXT — the next UID the store will assign (RFC 3501 §2.3.1.1).</summary>
-    public uint UidNext { get; }
+    /// <summary>UIDNEXT — the next UID the store will assign (RFC 3501 §2.3.1.1). Advances as new mail is detected.</summary>
+    public uint UidNext { get; private set; }
 
     /// <summary>The constant UIDVALIDITY (the UID is the never-reused message number).</summary>
     public uint UidValidity { get; } = ImapBackend.UidValidity;
@@ -103,14 +103,7 @@ public sealed class ImapMailbox
     {
         ArgumentNullException.ThrowIfNull(handle);
 
-        if (Folder.Kind == ImapFolderKind.Inbox)
-        {
-            _store.MarkRead(handle.Uid, Callsign);
-        }
-        else
-        {
-            _store.SetReadByUser(Callsign, handle.Uid);
-        }
+        _backend.MarkSeen(Folder, Callsign, handle.Uid);
 
         if (handle.Seen)
         {
@@ -119,6 +112,36 @@ public sealed class ImapMailbox
 
         handle.Seen = true;
         return true;
+    }
+
+    /// <summary>
+    /// Re-reads the folder and appends any message that has arrived since this snapshot (UID greater
+    /// than the current maximum), as new sequence numbers at the end — leaving existing handles (and
+    /// their in-session <c>\Seen</c> state) untouched. Returns the number of new messages appended.
+    /// This is how a long-lived selected session (an iPhone holding the mailbox open and polling with
+    /// <c>NOOP</c>) learns about new mail: the engine reports the grown <c>EXISTS</c> count afterwards.
+    /// (Messages are only ever added in this read-mostly server; nothing is expunged, so sequence
+    /// numbers stay stable.)
+    /// </summary>
+    public int CheckForNewMessages()
+    {
+        long maxUid = MaxUid;
+        int added = 0;
+        foreach (ImapMessageHandle handle in _backend.BuildHandles(Callsign, Folder))
+        {
+            if (handle.Uid > maxUid)
+            {
+                _handles.Add(new ImapMessageHandle(_handles.Count + 1, handle.Uid, handle.Seen, handle.Message));
+                added++;
+            }
+        }
+
+        if (added > 0)
+        {
+            UidNext = _backend.CurrentUidNext();
+        }
+
+        return added;
     }
 }
 

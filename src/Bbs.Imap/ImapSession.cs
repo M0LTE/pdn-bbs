@@ -91,6 +91,7 @@ public sealed class ImapSession
                 await HandleSearchAsync(tag, args, byUid: false, cancellationToken).ConfigureAwait(false);
                 break;
             case "NOOP":
+                await ReportNewMailAsync(cancellationToken).ConfigureAwait(false);
                 await Tagged(tag, "OK", "NOOP completed", cancellationToken).ConfigureAwait(false);
                 break;
             case "LOGOUT":
@@ -129,7 +130,16 @@ public sealed class ImapSession
                 await HandleUidAsync(tag, args, cancellationToken).ConfigureAwait(false);
                 break;
             case "CHECK":
-                await RequireSelected(tag, "CHECK completed", cancellationToken).ConfigureAwait(false);
+                if (_mailbox is null)
+                {
+                    await Tagged(tag, "NO", "No mailbox selected", cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await ReportNewMailAsync(cancellationToken).ConfigureAwait(false);
+                    await Tagged(tag, "OK", "CHECK completed", cancellationToken).ConfigureAwait(false);
+                }
+
                 break;
             case "EXPUNGE":
                 // Nothing is deletable this slice; EXPUNGE is a successful no-op (no untagged EXPUNGE).
@@ -675,6 +685,19 @@ public sealed class ImapSession
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /// <summary>
+    /// If a mailbox is selected and new mail has arrived since the snapshot, append it and send an
+    /// untagged <c>* n EXISTS</c> so a polling client (iPhone Mail NOOPing on a held connection) learns
+    /// of it and fetches the new messages. No-op when no mailbox is selected or nothing is new.
+    /// </summary>
+    private async Task ReportNewMailAsync(CancellationToken cancellationToken)
+    {
+        if (_mailbox is not null && _mailbox.CheckForNewMessages() > 0)
+        {
+            await _connection.WriteAsync($"* {_mailbox.Count} EXISTS\r\n", cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     private async Task RequireSelected(string tag, string okText, CancellationToken cancellationToken)
     {

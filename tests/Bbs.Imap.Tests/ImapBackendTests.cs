@@ -129,6 +129,30 @@ public sealed class ImapBackendTests
     }
 
     [Fact]
+    public void CheckForNewMessages_AppendsArrivals_PreservingExistingHandles()
+    {
+        using var test = new TestStore();
+        Message first = test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "first"));
+        var backend = new ImapBackend(test.Store);
+        ImapMailbox inbox = backend.OpenMailbox("M0LTE", backend.ResolveFolder("M0LTE", "INBOX")!)!;
+
+        Assert.Equal(1, inbox.Count);
+        Assert.Equal(0, inbox.CheckForNewMessages()); // nothing new yet
+        inbox.MarkSeen(inbox.Messages[0]);            // mark the existing one read in-session
+
+        // A new personal arrives while the mailbox is open.
+        Message second = test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "second"));
+
+        Assert.Equal(1, inbox.CheckForNewMessages());           // one new message detected
+        Assert.Equal(2, inbox.Count);
+        Assert.Equal(second.Number, inbox.Messages[1].Uid);     // appended at seq 2
+        Assert.Equal(2, inbox.Messages[1].Sequence);
+        Assert.True(inbox.Messages[0].Seen);                    // existing handle's in-session flag preserved
+        Assert.Equal(first.Number, inbox.Messages[0].Uid);
+        Assert.Equal(0, inbox.CheckForNewMessages());           // idempotent — nothing new now
+    }
+
+    [Fact]
     public void ResolveFolder_UnknownMailbox_ReturnsNull()
     {
         using var test = new TestStore();
