@@ -29,10 +29,16 @@ internal sealed class ImapServerHarness : IAsyncDisposable
     public int Port => _server.BoundPort;
 
     /// <summary>Starts a plaintext server over <paramref name="store"/> and waits until it has bound a port.</summary>
-    public static async Task<ImapServerHarness> StartAsync(BbsStore store, TimeProvider time)
+    public static async Task<ImapServerHarness> StartAsync(
+        BbsStore store, TimeProvider time, TimeSpan? idlePollInterval = null)
     {
-        var server = new ImapServer(
-            new ImapServerOptions { Bind = "127.0.0.1", Port = 0, TlsEnabled = false }, store, time);
+        var options = new ImapServerOptions { Bind = "127.0.0.1", Port = 0, TlsEnabled = false };
+        if (idlePollInterval is { } interval)
+        {
+            options = options with { IdlePollInterval = interval };
+        }
+
+        var server = new ImapServer(options, store, time);
         var cts = new CancellationTokenSource();
         Task serverTask = server.RunAsync(cts.Token);
 

@@ -116,7 +116,7 @@ public sealed partial class ImapServer
                 }
 
                 using var connection = new ImapConnection(stream);
-                var session = new ImapSession(connection, _backend);
+                var session = new ImapSession(connection, _backend, _options.IdlePollInterval);
                 await session.RunAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
@@ -173,4 +173,11 @@ public sealed record ImapServerOptions
 
     /// <summary>Where a generated self-signed cert is persisted (under the state dir).</summary>
     public string SelfSignedCertPath { get; init; } = "imap-cert.pfx";
+
+    /// <summary>
+    /// How often an <c>IDLE</c>-ing session re-checks the selected folder for new mail to push
+    /// (RFC 2177). The default trades a few seconds of worst-case new-mail latency for a single cheap
+    /// store read per interval; tests inject a small value.
+    /// </summary>
+    public TimeSpan IdlePollInterval { get; init; } = TimeSpan.FromSeconds(5);
 }
