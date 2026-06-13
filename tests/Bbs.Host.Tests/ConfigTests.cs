@@ -220,7 +220,7 @@ public sealed class ConfigTests : IDisposable
         // IMAP is default-off: a node that does not configure it behaves exactly as before.
         Assert.False(config.Imap.Enabled);
         Assert.Equal("127.0.0.1", config.Imap.Bind);
-        Assert.Equal(1143, config.Imap.Port);
+        Assert.Equal(993, config.Imap.Port); // standard implicit-TLS IMAP (the .deb grants CAP_NET_BIND_SERVICE)
         Assert.True(config.Imap.Tls.Enabled); // TLS defaults ON whenever IMAP is enabled
         Assert.True(config.Imap.Tls.GenerateSelfSigned);
         Assert.Null(config.Imap.Tls.CertificatePath);
