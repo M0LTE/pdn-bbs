@@ -77,10 +77,12 @@ public sealed record ImapConfig
     public string Bind { get; init; } = "127.0.0.1";
 
     /// <summary>
-    /// TCP port. Defaults to 1143 (the IANA unprivileged IMAP test port) so a non-root app needs no
-    /// capability to bind it; set 143 (plaintext) or 993 (implicit TLS) when run with the privilege to.
+    /// TCP port. Defaults to 993, the standard implicit-TLS IMAP port (so iPhone Mail's port-less
+    /// "Add Mail Account" flow auto-discovers it). 993 is privileged (&lt;1024); the pdn .deb's systemd
+    /// unit grants the service <c>CAP_NET_BIND_SERVICE</c> so the non-root <c>packetnet</c> user can bind
+    /// it. For a manual non-root run without that capability, set 1143 (the IANA unprivileged test port).
     /// </summary>
-    public int Port { get; init; } = 1143;
+    public int Port { get; init; } = 993;
 
     /// <summary>Implicit-TLS settings (default off ⇒ plaintext). When on, every accepted socket is wrapped in TLS.</summary>
     public ImapTlsConfig Tls { get; init; } = new();
@@ -396,8 +398,9 @@ public static class BbsHostConfigFile
         #       pair a LAN bind with tls.enabled.
         #   enabled: start the IMAP listener at all (default false)
         #   bind:    bind address (default 127.0.0.1; set 0.0.0.0 or a LAN IP for phones)
-        #   port:    TCP port (default 1143 — an unprivileged port; use 143 plaintext or 993
-        #            implicit-TLS when the app has the privilege to bind them)
+        #   port:    TCP port (default 993 — the standard implicit-TLS IMAP port iPhone Mail
+        #            auto-discovers; the pdn .deb grants CAP_NET_BIND_SERVICE to bind it. Use 1143
+        #            for a manual non-root run without that capability, or 143 for plaintext.)
         #   tls:     implicit TLS (RFC 8314 — TLS from the first byte, the iPhone "SSL" model)
         #     enabled:             wrap every connection in TLS (DEFAULT TRUE — if you expose IMAP
         #                          you want it encrypted; set false only for a deliberately-plaintext
@@ -411,7 +414,7 @@ public static class BbsHostConfigFile
         imap:
           enabled: false
           bind: 127.0.0.1
-          port: 1143
+          port: 993
           tls:
             enabled: true
             certificatePath: null
