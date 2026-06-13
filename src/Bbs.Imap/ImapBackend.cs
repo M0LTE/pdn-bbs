@@ -162,6 +162,17 @@ public sealed class ImapBackend
             return null;
         }
 
+        return new ImapMailbox(folder, callsign, BuildHandles(callsign, folder), CurrentUidNext(), this);
+    }
+
+    /// <summary>
+    /// The current ordered (ascending sequence-number) handles for <paramref name="folder"/> as the
+    /// session <paramref name="callsign"/> — a fresh read of the store. Shared by <see cref="OpenMailbox"/>
+    /// and the open mailbox's new-mail check (<see cref="ImapMailbox.CheckForNewMessages"/>); raw 7plus
+    /// part-bulletins are hidden (webmail parity).
+    /// </summary>
+    internal IReadOnlyList<ImapMessageHandle> BuildHandles(string callsign, ImapFolder folder)
+    {
         IReadOnlySet<long> sevenPlusParts = _store.GetSevenPlusPartMessageNumbers();
         IReadOnlyList<Message> messages = folder.Kind switch
         {
@@ -190,13 +201,30 @@ public sealed class ImapBackend
             }
 
             seq++;
-            bool seen = IsSeen(folder, message, callsign);
-            handles.Add(new ImapMessageHandle(seq, message.Number, seen, message));
+            handles.Add(new ImapMessageHandle(seq, message.Number, IsSeen(folder, message, callsign), message));
         }
 
-        // UIDNEXT is the next number the store will assign — stable for the session (RFC 3501 §2.3.1.1).
-        long uidNext = _store.GetLatestMessageNumber() + 1;
-        return new ImapMailbox(folder, callsign, handles, (uint)uidNext, _store);
+        return handles;
+    }
+
+    /// <summary>UIDNEXT — the next number the store will assign (RFC 3501 §2.3.1.1).</summary>
+    internal uint CurrentUidNext() => (uint)(_store.GetLatestMessageNumber() + 1);
+
+    /// <summary>
+    /// Records a <c>\Seen</c> mark for one message as <paramref name="callsign"/>: a personal stamps the
+    /// recipient read-row (<see cref="BbsStore.MarkRead"/>); a bulletin records per-user read-state
+    /// (<see cref="BbsStore.SetReadByUser"/> — the reader is not a named recipient).
+    /// </summary>
+    internal void MarkSeen(ImapFolder folder, string callsign, long uid)
+    {
+        if (folder.Kind == ImapFolderKind.Inbox)
+        {
+            _store.MarkRead(uid, callsign);
+        }
+        else
+        {
+            _store.SetReadByUser(callsign, uid);
+        }
     }
 
     /// <summary>

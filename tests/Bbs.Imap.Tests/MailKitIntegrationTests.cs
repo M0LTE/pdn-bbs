@@ -324,4 +324,30 @@ public sealed class MailKitIntegrationTests
         await client.DisconnectAsync(quit: true);
         Assert.False(client.IsConnected);
     }
+
+    [Fact]
+    public async Task NewMailWhileSelected_AppearsOnNoOp()
+    {
+        // A client holding INBOX open and polling with NOOP must learn about mail that arrives mid-session
+        // (the iPhone-stuck-on-an-old-snapshot bug): NOOP emits a fresh EXISTS and the message is fetchable.
+        using var test = new TestStore();
+        test.Store.SetMailPassword("M0LTE", "passphrase eleven");
+        test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "first"));
+        await using ImapServerHarness harness = await ImapServerHarness.StartAsync(test.Store, test.Time);
+
+        using ImapClient client = await harness.ConnectAsync();
+        await client.AuthenticateAsync("M0LTE", "passphrase eleven");
+        await client.Inbox.OpenAsync(FolderAccess.ReadOnly);
+        Assert.Equal(1, client.Inbox.Count);
+
+        // New mail arrives while the mailbox is held open, then the client polls.
+        test.Store.AddMessage(Drafts.Personal(to: "M0LTE", subject: "second"));
+        await client.NoOpAsync();
+
+        Assert.Equal(2, client.Inbox.Count); // EXISTS reported on NOOP
+        IList<IMessageSummary> summaries = await client.Inbox.FetchAsync(0, -1, MessageSummaryItems.Envelope);
+        Assert.Contains(summaries, s => s.Envelope?.Subject == "second");
+
+        await client.DisconnectAsync(quit: true);
+    }
 }
