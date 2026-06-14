@@ -26,8 +26,14 @@ public sealed record WebmailOptions
     /// </summary>
     public required IUserSettingsStore Settings { get; init; }
 
-    /// <summary>The BBS callsign (display + acceptance lines).</summary>
-    public required string BbsCallsign { get; init; }
+    /// <summary>
+    /// The station's connect identity — the SSID'd callsign you connect to (e.g. <c>M9YYY-1</c>),
+    /// shown in the page title and header. This is deliberately NOT the SSID-less mail-namespace
+    /// own-call: a user's mail address (<c>M0LTE@M9YYY.#42.GBR.EURO</c>), BIDs and R-lines stay
+    /// SSID-less and come from the store/routing-engine own-call, not from here. (The title was
+    /// twice mistakenly pointed at the bare mail call, dropping the SSID — hence the explicit name.)
+    /// </summary>
+    public required string StationCallsign { get; init; }
 
     /// <summary>The sysop callsign (sysop visibility in webmail), or empty.</summary>
     public string SysopCallsign { get; init; } = "";
@@ -760,9 +766,9 @@ public static class Webmail
 
     private static string Page(WebmailOptions o, string prefix, string call, string title, string body) => $$"""
         <!doctype html>
-        <html><head><meta charset="utf-8"><title>{{H(o.BbsCallsign)}} — {{H(title)}}</title>{{Style}}</head>
+        <html><head><meta charset="utf-8"><title>{{H(o.StationCallsign)}} — {{H(title)}}</title>{{Style}}</head>
         <body><main>
-        <h1>{{H(o.BbsCallsign)}} <span class="dim">webmail</span></h1>
+        <h1>{{H(o.StationCallsign)}} <span class="dim">webmail</span></h1>
         <nav><a href="{{U(prefix, "/")}}">Inbox</a> · <a href="{{U(prefix, "/bulletins")}}">Bulletins</a> · <a href="{{U(prefix, "/compose")}}">Compose</a> · <a href="{{U(prefix, "/settings")}}">Settings</a>
         <span class="dim">— de {{H(call)}}</span></nav>
         {{body}}

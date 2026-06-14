@@ -57,7 +57,9 @@ public sealed class WebmailTests : IAsyncDisposable
             Store = _store,
             Routing = _routing,
             Settings = _settings,
-            BbsCallsign = "GB7PDN",
+            // The station identity is SSID'd (the connect callsign), distinct from the SSID-less
+            // mail own-call "GB7PDN" the store/engine use above — so BIDs are GB7PDN while the title is GB7PDN-1.
+            StationCallsign = "GB7PDN-1",
             SysopCallsign = "G0SYS", // distinct from the test users — sysop may read/kill anything
         };
         if (maxUploadBytes is { } cap)
@@ -124,6 +126,22 @@ public sealed class WebmailTests : IAsyncDisposable
         string inbox = await client.GetStringAsync(new Uri("/", UriKind.Relative));
         Assert.Contains("Inbox", inbox, StringComparison.Ordinal);
         Assert.Contains("M0LTE", inbox, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Header_ShowsTheSsiddStationIdentity_NotTheBareMailCall()
+    {
+        // The webmail title/header is the STATION identity — the SSID'd connect callsign (here
+        // GB7PDN-1) — distinct from the SSID-less mail own-call (GB7PDN) the store/engine use for
+        // BIDs/R-lines/@home. Regression: the title was twice pointed at the bare mail call, dropping
+        // the SSID. Both the <title> and the <h1> must carry the SSID.
+        ClaimCallsign("tom", "M0LTE");
+        using HttpClient client = await StartAsync(pdnUser: "tom");
+
+        string page = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+
+        Assert.Contains("<title>GB7PDN-1 —", page, StringComparison.Ordinal);
+        Assert.Contains("<h1>GB7PDN-1 <span", page, StringComparison.Ordinal);
     }
 
     [Fact]
