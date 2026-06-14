@@ -77,6 +77,29 @@ public sealed class RoutingEngineTests
     }
 
     [Fact]
+    public void LocalDelivery_OwnCallMustBeSsidLess_ElseWwRootedAtUnderOurHaLeaksToWildcard()
+    {
+        // The engine's own-call must be the SSID-LESS base (a mail address never carries an SSID —
+        // the SSID is a connect-level partner detail; HostComposition feeds baseCallsign). Our @home
+        // leaf IS the own-call, and the "station strictly under our HA → deliver here" test is
+        // _ownHa.AreaContains(at), which HierarchicalAddress compares ORDINALLY (no SSID-stripping).
+        // A station BELOW us (SUB.GB7PDN.#23.GBR.EURO) does not match via the SSID-insensitive
+        // AtBbs/BaseEquals clause — only via AreaContains — so an engine built with an SSID'd
+        // own-call (GB7PDN-1) gets @home leaf GB7PDN-1, misses the match, and LEAKS the message to
+        // the catch-all partner. Built base, it stays here.
+        var wildcard = P("GB7RDG", at: ["*"]);
+        var ssidLess = new RoutingEngine("GB7PDN", "#23.GBR.EURO");
+        var ssidd = new RoutingEngine("GB7PDN-1", "#23.GBR.EURO");
+
+        RoutingRequest atUnderUs = Personal("M0LTE", "SUB.GB7PDN.#23.GBR.EURO");
+        Assert.Empty(ssidLess.Route(atUnderUs, [wildcard]).Targets); // stays here (correct)
+        // Regression guard: the SSID'd own-call leaks it to the catch-all — exactly the bug the
+        // HostComposition baseCallsign wiring prevents. (Documents the divergence; if a future change
+        // makes the engine SSID-insensitive on this path too, flip this to Assert.Empty.)
+        Assert.Equal("GB7RDG", Assert.Single(ssidd.Route(atUnderUs, [wildcard]).Targets).PartnerCall);
+    }
+
+    [Fact]
     public void LocalDelivery_NoAt_NonLocalUser_StillRoutesToWildcard()
     {
         // The rule must not over-suppress: a no-AT personal whose TO is NOT a local user still

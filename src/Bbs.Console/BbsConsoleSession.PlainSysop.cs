@@ -145,11 +145,16 @@ public sealed partial class BbsConsoleSession
     }
 
     /// <summary>
-    /// The <see cref="RoutingEngine"/> for the <c>route</c> explain — our own call (the BBS
-    /// callsign) plus the configured H-Route, exactly as <c>HostComposition</c> builds the live
-    /// engine. Built per call (the explain is rare and read-only; no need to cache).
+    /// The <see cref="RoutingEngine"/> for the <c>route</c> explain — our own call plus the
+    /// configured H-Route, exactly as <c>HostComposition</c> builds the live engine. The live
+    /// engine's own-call is the SSID-LESS base (a mail address never carries an SSID — the SSID is
+    /// a connect-level partner detail), so the explain engine must strip the SSID off the console's
+    /// (SSID'd, for the prompt) BbsCallsign too — otherwise our @home leaf would be <c>&lt;call&gt;-N</c>
+    /// and the local-delivery explanation could diverge from real routing for an @&lt;ownbase&gt;
+    /// address (HierarchicalAddress compares ordinally). Built per call (the explain is rare and
+    /// read-only; no need to cache).
     /// </summary>
-    private RoutingEngine RouteExplainEngine() => new(_config.BbsCallsign, _config.HRoute);
+    private RoutingEngine RouteExplainEngine() => new(Callsigns.StripSsid(_config.BbsCallsign), _config.HRoute);
 
     /// <summary>
     /// Renders a <see cref="RoutingDecision"/> for a personal as one plain sentence (forwarding.md
