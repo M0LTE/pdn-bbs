@@ -249,7 +249,11 @@ public static class HostComposition
             // The same per-user settings singleton the console session uses — a webmail
             // interface-mode flip is the persisted choice the next console connect reads.
             Settings = app.Services.GetRequiredService<IUserSettingsStore>(),
-            BbsCallsign = baseCallsign,
+            // The webmail title/header shows the STATION identity — the SSID'd connect callsign you
+            // connect to (e.g. M9YYY-1), the same identity as the console prompt and RHP bind. It is
+            // NOT the mail-namespace own-call: users' mail addresses (M0LTE@M9YYY.#42.GBR.EURO), BIDs
+            // and R-lines stay SSID-less and come from the store/engine own-call (baseCallsign) above.
+            StationCallsign = bindCallsign,
             SysopCallsign = config.Sysop,
         });
 
