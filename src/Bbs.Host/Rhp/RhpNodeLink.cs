@@ -143,6 +143,17 @@ public sealed class RhpNodeLink : IAsyncDisposable
                     await client.AuthenticateAsync(user, _options.Pass ?? "", cancellationToken).ConfigureAwait(false);
                 }
 
+                // Publish the client BEFORE the first listen succeeds. An accept push can only
+                // arrive on a successful listener, so this guarantees `_client` is non-null by the
+                // time any accept reaches `OnAccepted` → the demux → `child.SendAsync(SID)`. Wiring
+                // `Accepted` but leaving `_client` null until after bind/listen left a window where
+                // the demux greeted an accepted child against a null `_client` and threw "link is
+                // down": the SID never reached the wire, so the caller's read either timed out or —
+                // if `_client` was published in the gap before the failure cleanup ran — saw the
+                // child closed (a completed read channel → ChannelClosedException). Setting it here
+                // closes that window for both the primary and service-alias listeners.
+                _client = client;
+
                 // Bind + listen the primary BBS callsign (with a free-SSID probe when it was derived
                 // from the node), then ALSO bind the friendly service alias ("BBS"). Both listens are
                 // on the one client, so every accept — for either callsign — flows through Accepted.
@@ -150,7 +161,6 @@ public sealed class RhpNodeLink : IAsyncDisposable
                 _boundCallsign = bound;
                 await BindServiceAliasAsync(client, cancellationToken).ConfigureAwait(false);
 
-                _client = client;
                 _up.TrySetResult();
                 backoff = _options.InitialBackoff;
                 LogBound(_logger, bound, _options.Host, _options.Port, null);
