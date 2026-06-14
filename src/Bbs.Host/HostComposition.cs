@@ -58,7 +58,12 @@ public static class HostComposition
         builder.WebHost.ConfigureKestrel(kestrel =>
             kestrel.Listen(IPAddress.Parse(config.Web.Bind), config.Web.Port));
 
-        var store = BbsStore.Open(Path.Combine(stateDir, "bbs.db"), bindCallsign, time);
+        // The store's BbsCallsign is the MAIL namespace identity (it generates BIDs, which carry
+        // the BBS call SSID-less per compat spec §2.3). A mail address never carries an SSID — the
+        // SSID is a connect-level detail of the partner relationship, not the mail identity — so
+        // feed the SSID-less base, NOT the SSID'd bind callsign. (BidGenerator strips the SSID
+        // internally too; this keeps the layer's own identity correct at the source.)
+        var store = BbsStore.Open(Path.Combine(stateDir, "bbs.db"), baseCallsign, time);
         builder.Services.AddSingleton(store); // owned by the host: disposed on shutdown
 
         // Partners: config is the source of truth (v1) — upsert everything configured, prune the rest.
@@ -71,7 +76,14 @@ public static class HostComposition
             SoftwareVersion = "PDN" + version,
         };
 
-        var engine = new RoutingEngine(bindCallsign, config.HRoute);
+        // The routing engine's own-call is the MAIL namespace identity: it forms our hierarchical
+        // @home address (own-call leaf element) and the R-line own-call, both SSID-less (a mail
+        // address never carries an SSID — the SSID is a connect-level partner detail). Feeding the
+        // SSID'd bind callsign would make our @home leaf `M9YYY-1`, which HierarchicalAddress
+        // compares ordinally (no SSID-stripping) — local mail addressed @M9YYY would then miss the
+        // local-delivery test and wrongly forward. Routing comparisons still use BaseEquals, so the
+        // SSID-less own-call resolves the same partners.
+        var engine = new RoutingEngine(baseCallsign, config.HRoute);
 
         var consoleConfig = new BbsConsoleConfig
         {

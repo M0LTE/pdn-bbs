@@ -126,6 +126,25 @@ public sealed class PlainSysopTests : IDisposable
     }
 
     [Fact]
+    public async Task Route_AddressedUnderOurHa_StaysHere_EvenWhenOurOwnCallCarriesAnSsid()
+    {
+        // The route-explain engine must use our SSID-LESS base own-call, exactly as the live
+        // RoutingEngine does (a mail address never carries an SSID — the SSID is a connect-level
+        // partner detail). Under pdn our own-call (the console BbsCallsign, used for the prompt)
+        // carries an SSID; a personal addressed to a station strictly UNDER our HA
+        // (sub.GB7PDN.#23.GBR.EURO) resolves local only via _ownHa.AreaContains, which compares
+        // ordinally. If the explain engine kept the SSID, our @home leaf would be GB7PDN-1, the
+        // match would miss, and it would wrongly route to the catch-all partner instead of staying
+        // here — diverging from real routing (the whole point of the explain trace).
+        _h.Config = _h.Config with { BbsCallsign = "GB7PDN-1" };
+        AddPartner("GB7RDG-2", atCalls: ["*"]); // a catch-all that would swallow it if @home missed
+        (_, ScriptedTerminal t) = await AsSysop("route g4abc@sub.gb7pdn.#23.gbr.euro", "quit");
+
+        Assert.Contains("would stay here", t.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("would go to GB7RDG-2", t.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Route_HierarchicalRegionMatch_NamesRegionAndCloseness_NoDepthJargon()
     {
         // GB7RDG-2 carries personals toward GBR.EURO; route a personal addressed @GBR.EURO.
