@@ -137,7 +137,9 @@ public static class Webmail
             WithCallsign(ctx, options, (_, call) => DownloadAttachment(options, call, number, name)));
 
         app.MapGet("/compose", (HttpContext ctx, string? to, string? type) => WithCallsign(ctx, options,
-            (prefix, call) => ComposeForm(options, prefix, call, to, type, Embed(ctx), Theme(ctx))));
+            // theme: NAMED — it must land in `theme`, not the positional `error` slot (which would
+            // render the theme string in a red error box AND drop the dark class → a light page).
+            (prefix, call) => ComposeForm(options, prefix, call, to, type, Embed(ctx), theme: Theme(ctx))));
 
         app.MapPost("/compose", async (HttpContext ctx) =>
         {
@@ -445,10 +447,10 @@ public static class Webmail
             <tr><th>To</th><td>{H(to)}{(message.At is null ? "" : " @ " + H(message.At))}</td></tr>
             {ccRow}
             <tr><th>Subject</th><td>{H(message.Subject)}</td></tr>
-            <tr><th>BID</th><td>{H(message.Bid)}</td></tr>
+            <tr><th>Network ID</th><td>{H(message.Bid)}</td></tr>
             <tr><th>Date</th><td>{H(message.CreatedAt.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture))}</td></tr>
             </table>
-            <pre>{H(message.GetBodyText())}</pre>
+            {RenderMessageBody(message)}
             {attachments}
             {killForm}
             """, theme));
@@ -988,6 +990,107 @@ public static class Webmail
         return sb.ToString();
     }
 
+    private static readonly UTF8Encoding Utf8Strict = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    /// <summary>
+    /// Decode a stored message body for DISPLAY: UTF-8 when the bytes are valid UTF-8 (the common
+    /// ASCII / UTF-8 case — gateways, Winlink, copy-pasted smart quotes), else Latin-1 (genuine
+    /// 8-bit packet content). Bodies are stored byte-transparent (Latin-1 round-trips for
+    /// forwarding fidelity), but forcing UTF-8 content through Latin-1 mojibakes it (a smart quote
+    /// shows as stray high-byte glyphs, "â€¦"). Render-only — the stored bytes are untouched.
+    /// </summary>
+    private static string DecodeBodyForDisplay(ReadOnlyMemory<byte> body)
+    {
+        try
+        {
+            return Utf8Strict.GetString(body.Span);
+        }
+        catch (DecoderFallbackException)
+        {
+            return Encoding.Latin1.GetString(body.Span);
+        }
+    }
+
+    /// <summary>
+    /// Render a message body for the reader: the actual content in a <c>&lt;pre&gt;</c>, with any
+    /// leading FBB <c>R:</c> routing-trace lines lifted out below into a friendly relayed-path line
+    /// + a collapsed raw block — so the cryptic "R:260614/1246Z 1207@GB7RDG.#42.GBR.EURO …" headers
+    /// don't bury the message. Body decoded UTF-8-or-Latin-1 (<see cref="DecodeBodyForDisplay"/>).
+    /// </summary>
+    private static string RenderMessageBody(Message message)
+    {
+        string[] lines = DecodeBodyForDisplay(message.Body).ReplaceLineEndings("\n").Split('\n');
+        int i = 0;
+        var trace = new List<string>();
+        while (i < lines.Length && lines[i].StartsWith("R:", StringComparison.Ordinal))
+        {
+            trace.Add(lines[i]);
+            i++;
+        }
+
+        // Drop a single blank separator the trace block conventionally ends with.
+        if (i < lines.Length && lines[i].Trim().Length == 0)
+        {
+            i++;
+        }
+
+        string content = string.Join("\n", lines.Skip(i));
+        return Inv($"<pre>{H(content)}</pre>") + RenderTrace(trace);
+    }
+
+    /// <summary>
+    /// Friendly rendering of the FBB <c>R:</c> trace: a "Relayed: origin → … → here" path (each hop
+    /// is the BBS after <c>@</c>/<c>@:</c> in an R: line; R: lines are prepended newest-first, so we
+    /// reverse to read origin→here) plus a collapsed raw block. Empty when there is no trace.
+    /// </summary>
+    private static string RenderTrace(List<string> trace)
+    {
+        if (trace.Count == 0)
+        {
+            return "";
+        }
+
+        var hops = new List<string>();
+        foreach (string line in trace)
+        {
+            if (ExtractTraceBbs(line) is { Length: > 0 } bbs)
+            {
+                hops.Add(bbs);
+            }
+        }
+
+        hops.Reverse(); // R: lines read newest(here)→oldest(origin) top-down; show origin→here.
+        string path = hops.Count > 0
+            ? Inv($"""<p class="dim trace-path">Relayed: {H(string.Join(" → ", hops))}</p>""")
+            : "";
+        string raw = string.Join("\n", trace);
+        return path + Inv($"""<details class="trace"><summary>Routing headers ({trace.Count})</summary><pre>{H(raw)}</pre></details>""");
+    }
+
+    /// <summary>The relaying BBS callsign in an R: line — the token after <c>@</c> (or <c>@:</c>) up to the first dot/space; null when absent.</summary>
+    private static string? ExtractTraceBbs(string rLine)
+    {
+        int at = rLine.IndexOf('@', StringComparison.Ordinal);
+        if (at < 0)
+        {
+            return null;
+        }
+
+        int start = at + 1;
+        if (start < rLine.Length && rLine[start] == ':')
+        {
+            start++; // the "@:" form
+        }
+
+        int end = start;
+        while (end < rLine.Length && rLine[end] != '.' && !char.IsWhiteSpace(rLine[end]))
+        {
+            end++;
+        }
+
+        return end > start ? rLine[start..end] : null;
+    }
+
     /// <summary>Plain-language message type for the reader — no terse wire letters (P/B/T).</summary>
     private static string TypeWord(MessageType type) => type switch
     {
@@ -1018,7 +1121,7 @@ public static class Webmail
         }
 
         var sb = new StringBuilder();
-        sb.Append("<table><tr><th>#</th><th class=\"read-col\"></th><th>From</th><th>To</th><th>Date</th><th>Subject</th></tr>");
+        sb.Append("<table><tr><th>#</th><th class=\"read-col\"></th><th>From</th><th>To</th><th>Date (UTC)</th><th>Subject</th></tr>");
         foreach (Message m in slice)
         {
             bool unreadByMe = m.Recipients.Any(r =>
@@ -1031,7 +1134,7 @@ public static class Webmail
             sb.Append(Inv($"<tr{(unreadByMe ? " class=\"unread\"" : "")}><td>{m.Number}</td>"))
               .Append(Inv($"<td class=\"read-col\">{readDot}</td><td>{H(m.From)}</td>"))
               .Append(Inv($"<td>{H(string.Join(";", m.Recipients.Where(r => !r.Cc).Select(r => r.ToCall)))}{(m.At is null ? "" : "@" + H(m.At))}</td>"))
-              .Append(Inv($"<td>{H(m.CreatedAt.ToString("yyMMdd", CultureInfo.InvariantCulture))}</td><td>{subject}</td></tr>"));
+              .Append(Inv($"<td class=\"nowrap\">{H(m.CreatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))}</td><td>{subject}</td></tr>"));
         }
 
         sb.Append("</table><p class=\"pager\">");
@@ -1076,7 +1179,7 @@ public static class Webmail
             <html{{HtmlThemeClass(theme)}}><head><meta charset="utf-8"><title>{{H(o.StationCallsign)}} — {{H(title)}}</title>{{Style}}</head>
             <body><main{{mainClass}}>
             {{header}}<nav><a href="{{U(prefix, "/", embed)}}">Inbox</a> · <a href="{{U(prefix, "/bulletins", embed)}}">Bulletins</a> · <a href="{{U(prefix, "/compose", embed)}}">Compose</a> · <a href="{{U(prefix, "/settings", embed)}}">Settings</a>{{forwardingTab}}
-            <span class="dim">— de {{H(call)}}</span></nav>
+            <span class="dim">signed in as {{H(call)}}</span></nav>
             {{body}}
             </main></body></html>
             """;
@@ -1165,6 +1268,11 @@ public static class Webmail
         th.read-col,td.read-col{width:1.4rem;text-align:center;padding-left:0;padding-right:.2rem}
         .unread-dot{color:hsl(var(--primary));font-size:.7rem;line-height:1}
         .back{margin:0 0 .85rem;font-size:.8rem}
+        td.nowrap{white-space:nowrap}
+        .trace-path{margin:1rem 0 .25rem}
+        details.trace{margin:0 0 1rem;font-size:.8rem}
+        details.trace summary{cursor:pointer;color:hsl(var(--muted-foreground));user-select:none}
+        details.trace pre{margin-top:.5rem;font-size:.78rem;line-height:1.5}
         tbody tr:hover td,table tr:hover td{background:hsl(var(--accent)/.5)}
         pre{
           background:hsl(var(--card));border:1px solid hsl(var(--border));

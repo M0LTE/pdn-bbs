@@ -1391,6 +1391,93 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.DoesNotContain(">St<", inbox, StringComparison.Ordinal);        // the archaic status-code column is gone
     }
 
+    [Fact]
+    public async Task ReadMessage_DecodesUtf8Body_NoMojibake()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        // A UTF-8 “smart quote” pair (U+201C/U+201D) — mojibakes to "â€¦" if forced through Latin-1.
+        byte[] body = Encoding.UTF8.GetBytes("the “flag”\r");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "G8ABC", Recipients = ["M0LTE"], Subject = "utf8", Body = body,
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        Assert.Contains("“flag”", page, StringComparison.Ordinal); // the real smart quotes
+        Assert.DoesNotContain("â", page, StringComparison.Ordinal);     // no "â" mojibake
+    }
+
+    [Fact]
+    public async Task ReadMessage_LiftsRTraceIntoAFriendlyPath_AndShowsTheContent()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        byte[] body = Encoding.Latin1.GetBytes(
+            "R:260614/1246Z 1207@GB7RDG.#42.GBR.EURO LinBPQ6.0.25\r" +
+            "R:260614/1240Z 17277@VK2RZ.#SYD.NSW.AUS.OC LinBPQ6.0.25\r" +
+            "\r" +
+            "Actual message text.\r");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Bulletin, From = "G8ABC", Recipients = ["PACKET"], Subject = "traced", Body = body,
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        Assert.Contains("Actual message text.", page, StringComparison.Ordinal);   // content shown cleanly
+        Assert.Contains("Relayed:", page, StringComparison.Ordinal);               // friendly path summary
+        Assert.Contains("VK2RZ → GB7RDG", page, StringComparison.Ordinal);    // origin → here order
+        Assert.Contains("Routing headers (2)", page, StringComparison.Ordinal);    // collapsible raw block
+    }
+
+    [Fact]
+    public async Task Compose_FromDarkTheme_RendersDark_WithNoSpuriousErrorBox()
+    {
+        // Regression: GET /compose passed Theme(ctx) into the positional `error` slot, so the theme
+        // string rendered in a red error box AND the dark class was dropped (a light page).
+        ClaimCallsign("tom", "M0LTE");
+        using HttpClient client = await StartAsync();
+
+        HttpResponseMessage resp = await client.GetAsync(new Uri("/compose?pdn_embed=1&theme=dark", UriKind.Relative));
+        resp.EnsureSuccessStatusCode();
+        string page = await resp.Content.ReadAsStringAsync();
+
+        Assert.Contains("<html class=\"dark\">", page, StringComparison.Ordinal); // dark applied
+        Assert.DoesNotContain("class=\"err\"", page, StringComparison.Ordinal);   // no red error box
+    }
+
+    [Fact]
+    public async Task Inbox_ShowsFriendlyDateAndTime_NotTheTerseYymmdd()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "G8ABC", Recipients = ["M0LTE"], Subject = "dated", Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string inbox = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+        Assert.Contains("Date (UTC)", inbox, StringComparison.Ordinal);
+        Assert.Contains("2026-06-11 12:00", inbox, StringComparison.Ordinal); // the harness clock, date + time
+    }
+
+    [Fact]
+    public async Task ReadMessage_LabelsNetworkId_NotBID_AndNavReadsSignedInAs()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "G8ABC", Recipients = ["M0LTE"], Subject = "labels", Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        Assert.Contains("Network ID", page, StringComparison.Ordinal);
+        Assert.DoesNotContain(">BID<", page, StringComparison.Ordinal);
+        Assert.Contains("signed in as M0LTE", page, StringComparison.Ordinal);
+        Assert.DoesNotContain("de M0LTE", page, StringComparison.Ordinal);
+    }
+
     // ------------------------------------------------ forwarding view (sysop, read-only)
     // A sysop-only, read-only picture of how mail leaves this BBS: one panel per configured partner
     // with its dial config, the LIVE forward-queue depth, and the routing rules translated out of FBB
