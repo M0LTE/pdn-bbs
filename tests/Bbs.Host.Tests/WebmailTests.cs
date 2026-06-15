@@ -343,6 +343,39 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.DoesNotContain("INBOUND-not-mine", sent, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Sent_MessageView_BackLinkReturnsToSent_NotInbox()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message m = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            At = "GB7RDG",
+            Subject = "sent thing",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.EnqueueForwards(m.Number, ["GB7RDG"]);
+
+        using HttpClient client = await StartAsync();
+
+        // The Sent list links each row with the ?from=sent context marker.
+        string sent = await client.GetStringAsync(new Uri("/sent", UriKind.Relative));
+        Assert.Contains($"/messages/{m.Number}?from=sent", sent, StringComparison.Ordinal);
+
+        // Opened from Sent → the back link returns to Sent.
+        string fromSent = await client.GetStringAsync(new Uri($"/messages/{m.Number}?from=sent", UriKind.Relative));
+        Assert.Contains("Back to Sent", fromSent, StringComparison.Ordinal);
+        Assert.Contains("href=\"/sent\"", fromSent, StringComparison.Ordinal);
+        Assert.DoesNotContain("Back to Inbox", fromSent, StringComparison.Ordinal);
+
+        // Opened without the marker → the type-based default (a personal → Inbox) is unchanged.
+        string plain = await client.GetStringAsync(new Uri($"/messages/{m.Number}", UriKind.Relative));
+        Assert.Contains("Back to Inbox", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain("Back to Sent", plain, StringComparison.Ordinal);
+    }
+
     // ------------------------------------------------ B2 completeness: Cc + attachment download
 
     [Fact]

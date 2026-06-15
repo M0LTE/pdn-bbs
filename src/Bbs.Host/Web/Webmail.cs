@@ -149,8 +149,8 @@ public static class Webmail
         app.MapGet("/sent", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
             (prefix, call) => Sent(options, prefix, call, page ?? 1, Embed(ctx), Theme(ctx))));
 
-        app.MapGet("/messages/{number:long}", (HttpContext ctx, long number) => WithCallsign(ctx, options,
-            (prefix, call) => ReadMessage(options, prefix, call, number, Embed(ctx), Theme(ctx))));
+        app.MapGet("/messages/{number:long}", (HttpContext ctx, long number, string? from) => WithCallsign(ctx, options,
+            (prefix, call) => ReadMessage(options, prefix, call, number, Embed(ctx), Theme(ctx), from)));
 
         app.MapGet("/messages/{number:long}/attachments/{name}", (HttpContext ctx, long number, string name) =>
             WithCallsign(ctx, options, (_, call) => DownloadAttachment(options, call, number, name)));
@@ -515,7 +515,7 @@ public static class Webmail
         return sb.ToString();
     }
 
-    private static IResult ReadMessage(WebmailOptions o, string prefix, string call, long number, bool embed, string? theme)
+    private static IResult ReadMessage(WebmailOptions o, string prefix, string call, long number, bool embed, string? theme, string? from = null)
     {
         Message? message = o.Store.GetMessage(number);
         bool isSysop = IsSysop(o, call);
@@ -534,10 +534,13 @@ public static class Webmail
         string to = string.Join("; ", message.Recipients.Where(r => !r.Cc).Select(r => r.ToCall));
         string ccRow = RenderCcRow(message);
         string attachments = RenderAttachments(message, prefix, embed);
-        // Contextual back link to the list this message came from (personals → Inbox, else Bulletins),
-        // so a reader isn't stranded on the message with only the top nav to escape.
-        string backPath = message.Type == MessageType.Personal ? "/" : "/bulletins";
-        string backLabel = message.Type == MessageType.Personal ? "Inbox" : "Bulletins";
+        // Contextual back link to the list this message came from, so a reader isn't stranded on the
+        // message with only the top nav to escape. The Sent list links here with ?from=sent (a
+        // message we sent is a Personal, so type alone can't distinguish it from an inbox personal);
+        // otherwise fall back to the type-based default (personals → Inbox, else Bulletins).
+        bool fromSent = string.Equals(from, "sent", StringComparison.Ordinal);
+        string backPath = fromSent ? "/sent" : message.Type == MessageType.Personal ? "/" : "/bulletins";
+        string backLabel = fromSent ? "Sent" : message.Type == MessageType.Personal ? "Inbox" : "Bulletins";
         return Html(Page(o, prefix, call, Inv($"Message {message.Number}"), embed,
             $"""
             <p class="back"><a href="{U(prefix, backPath, embed)}">&laquo; Back to {backLabel}</a></p>
@@ -1557,7 +1560,7 @@ public static class Webmail
         {
             string to = H(string.Join(";", m.Recipients.Where(r => !r.Cc).Select(r => r.ToCall)))
                 + (m.At is null ? "" : "@" + H(m.At));
-            string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}"), embed)}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
+            string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}?from=sent"), embed)}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
             sb.Append(Inv($"<tr><td>{m.Number}</td><td>{to}</td>"))
               .Append(Inv($"<td class=\"nowrap\">{H(m.CreatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))}</td>"))
               .Append(Inv($"<td>{subject}</td><td>{ForwardStatusBadge(o.Store.GetMessageForwards(m.Number))}</td></tr>"));
