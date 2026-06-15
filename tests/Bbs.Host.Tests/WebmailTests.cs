@@ -51,7 +51,7 @@ public sealed class WebmailTests : IAsyncDisposable
 
     private async Task<HttpClient> StartAsync(
         string pdnUser = "tom", bool gatewayHeader = true, string? forwardedPrefix = null, bool autoRedirect = true,
-        int? maxUploadBytes = null)
+        int? maxUploadBytes = null, int? undoSendSeconds = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -72,6 +72,11 @@ public sealed class WebmailTests : IAsyncDisposable
         if (maxUploadBytes is { } cap)
         {
             options = options with { MaxUploadBytes = cap };
+        }
+
+        if (undoSendSeconds is { } undo)
+        {
+            options = options with { UndoSendSeconds = undo };
         }
 
         Webmail.Map(_app, options);
@@ -165,11 +170,13 @@ public sealed class WebmailTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task Compose_StoresRoutes_AndRedirectsHomeWithConfirmation()
+    public async Task Compose_WithUndoDisabled_StoresRoutes_AndRedirectsHomeWithConfirmation()
     {
+        // The immediate-route path (UndoSendSeconds=0): compose routes at once and confirms, the
+        // pre-undo-send behaviour. (With the default 5 s window it defers instead — see the next test.)
         ClaimCallsign("tom", "M0LTE");
         _store.UpsertPartner(new Partner { Call = "GB7BPQ", AtCalls = ["*"] });
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0);
 
         HttpResponseMessage response = await client.PostAsync(
             new Uri("/compose", UriKind.Relative),
@@ -195,15 +202,136 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.Equal("1_GB7PDN", stored.Bid);
         Assert.Equal("Hello\rWorld\r", stored.GetBodyText());
 
-        // Compose enqueues routing (implied-AT → GB7BPQ).
+        // Compose enqueues routing immediately (implied-AT → GB7BPQ).
         Assert.Equal(stored.Number, Assert.Single(_store.GetForwardQueue("GB7BPQ")).Number);
+    }
+
+    [Fact]
+    public async Task Compose_DefersTheSend_HeldWithMarker_NotRouted_AndRedirectsToSentBanner()
+    {
+        // The default undo-send window (5 s): compose stores the message, defers it (held + a
+        // send_release_utc marker, NOT routed), and redirects to /?sent=<n> — the home banner with Undo.
+        ClaimCallsign("tom", "M0LTE");
+        _store.UpsertPartner(new Partner { Call = "GB7BPQ", AtCalls = ["*"] });
+        using HttpClient client = await StartAsync(autoRedirect: false);
+
+        HttpResponseMessage response = await client.PostAsync(
+            new Uri("/compose", UriKind.Relative),
+            new FormUrlEncodedContent(
+            [
+                new KeyValuePair<string, string>("type", "P"),
+                new KeyValuePair<string, string>("to", "G8ABC@GB7BPQ"),
+                new KeyValuePair<string, string>("subject", "Deferred test"),
+                new KeyValuePair<string, string>("body", "Hello"),
+            ]));
+
+        Message stored = Assert.Single(_store.ListMessages(new MessageQuery { IncludeHeld = true }));
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Equal($"/?sent={stored.Number}", response.Headers.Location!.OriginalString);
+
+        // Deferred: held with a marker, and NOT yet in the forward queue (the worker routes it later).
+        Assert.Equal(MessageStatus.Held, stored.Status);
+        Assert.NotNull(stored.SendReleaseUtc);
+        Assert.Empty(_store.GetForwardQueue("GB7BPQ"));
+    }
+
+    [Fact]
+    public async Task StatusBanner_ForAPendingSend_RendersAnUndoFormPostingToUndoSend()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message m = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "pending",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.DeferSend(m.Number, windowSeconds: 5);
+
+        using HttpClient client = await StartAsync();
+        string home = await client.GetStringAsync(new Uri($"/?sent={m.Number}", UriKind.Relative));
+
+        Assert.Contains("Message sent", home, StringComparison.Ordinal);
+        Assert.Contains($"action=\"/messages/{m.Number}/undo-send\"", home, StringComparison.Ordinal);
+        Assert.Contains(">Undo</button>", home, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UndoSend_CancelsAPendingSend_ThenNoOpsOnceReleased()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message m = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "undo me",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.DeferSend(m.Number, windowSeconds: 5);
+
+        using HttpClient client = await StartAsync(autoRedirect: false);
+
+        // Within the window: Undo cancels it (status → K).
+        HttpResponseMessage cancel = await client.PostAsync(
+            new Uri($"/messages/{m.Number}/undo-send", UriKind.Relative), content: null);
+        Assert.Equal(HttpStatusCode.Found, cancel.StatusCode);
+        Assert.Contains("Send%20cancelled.", cancel.Headers.Location!.OriginalString, StringComparison.Ordinal);
+        Assert.Equal(MessageStatus.Killed, _store.GetMessage(m.Number)!.Status);
+
+        // A second message, released past its window: Undo is a no-op ("Already sent.").
+        Message other = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "too late",
+            Body = Encoding.Latin1.GetBytes("y\r"),
+        });
+        _store.DeferSend(other.Number, windowSeconds: 5);
+        _time.Advance(TimeSpan.FromSeconds(5));
+        _store.ReleaseDeferredSend(other.Number);
+
+        HttpResponseMessage late = await client.PostAsync(
+            new Uri($"/messages/{other.Number}/undo-send", UriKind.Relative), content: null);
+        Assert.Equal(HttpStatusCode.Found, late.StatusCode);
+        Assert.Contains("Already%20sent.", late.Headers.Location!.OriginalString, StringComparison.Ordinal);
+        Assert.NotEqual(MessageStatus.Killed, _store.GetMessage(other.Number)!.Status);
+    }
+
+    [Fact]
+    public async Task UndoSend_ByNonSenderNonSysop_IsRejected_AndLeavesItPending()
+    {
+        // Someone else's pending send: a normal user can't cancel it (sender base-equals / sysop only).
+        ClaimCallsign("bob", "2E0BOB"); // not the sender, not the sysop (G0SYS)
+        Message m = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "not yours",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.DeferSend(m.Number, windowSeconds: 5);
+
+        using HttpClient client = await StartAsync(pdnUser: "bob", autoRedirect: false);
+        HttpResponseMessage resp = await client.PostAsync(
+            new Uri($"/messages/{m.Number}/undo-send", UriKind.Relative), content: null);
+
+        Assert.Equal(HttpStatusCode.Found, resp.StatusCode);
+        Assert.Contains("Already%20sent.", resp.Headers.Location!.OriginalString, StringComparison.Ordinal);
+        Assert.Equal(MessageStatus.Held, _store.GetMessage(m.Number)!.Status); // still pending
+        Assert.NotNull(_store.GetMessage(m.Number)!.SendReleaseUtc);
     }
 
     [Fact]
     public async Task ComposeBulletin_GoesToTheBulletinsList()
     {
+        // Undo-send disabled so the bulletin lists immediately (a deferred send is held → hidden from
+        // the bulletins list until the worker releases it).
         ClaimCallsign("tom", "M0LTE");
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0);
 
         HttpResponseMessage response = await client.PostAsync(
             new Uri("/compose", UriKind.Relative),
@@ -1034,8 +1162,9 @@ public sealed class WebmailTests : IAsyncDisposable
                 new KeyValuePair<string, string>("body", "x"),
             ]));
         Assert.Equal(HttpStatusCode.Found, response.StatusCode);
-        // Redirects to the prefixed home with the "Message sent." banner.
-        Assert.StartsWith("/apps/bbs/?notice=", response.Headers.Location!.OriginalString, StringComparison.Ordinal);
+        // Compose defers (default 5 s window) and redirects to the prefixed home undo banner (?sent=<n>).
+        Message stored = Assert.Single(_store.ListMessages(new MessageQuery { IncludeHeld = true }));
+        Assert.Equal($"/apps/bbs/?sent={stored.Number}", response.Headers.Location!.OriginalString);
     }
 
     [Fact]
@@ -1213,8 +1342,10 @@ public sealed class WebmailTests : IAsyncDisposable
     [Fact]
     public async Task ComposeWithFile_SevenPlus_AppendsValidPartsToBody_RoundTripsByteExact()
     {
+        // Undo-send disabled (this exercises file handling, not deferral): a deferred send is held →
+        // excluded from ListMessages(default), so route immediately to assert the stored content.
         ClaimCallsign("tom", "M0LTE");
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0);
 
         // A byte spread (incl. high bytes + a NUL) that ONLY survives 7plus, not raw text.
         byte[] original = new byte[600];
@@ -1246,7 +1377,7 @@ public sealed class WebmailTests : IAsyncDisposable
     public async Task ComposeWithFile_Attachment_StoresMessageAttachment_AndBuildB2ObjectEmitsIt()
     {
         ClaimCallsign("tom", "M0LTE");
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0); // route now: assert stored content
 
         byte[] file = [0x00, 0x01, 0x02, 0xFD, 0xFE, 0xFF];
         HttpResponseMessage response = await client.PostAsync(
@@ -1277,7 +1408,7 @@ public sealed class WebmailTests : IAsyncDisposable
     public async Task ComposeWithFile_StripsPathComponentsFromTheName()
     {
         ClaimCallsign("tom", "M0LTE");
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0); // route now: assert stored content
 
         HttpResponseMessage response = await client.PostAsync(
             new Uri("/compose", UriKind.Relative),
@@ -1295,7 +1426,7 @@ public sealed class WebmailTests : IAsyncDisposable
     {
         ClaimCallsign("tom", "M0LTE");
         _store.UpsertPartner(new Partner { Call = "GB7BPQ", AtCalls = ["*"] });
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0); // route now: assert stored content
 
         // multipart with the text fields but NO file part: the dominant case, behaviour unchanged.
         HttpResponseMessage response = await client.PostAsync(
@@ -1316,7 +1447,7 @@ public sealed class WebmailTests : IAsyncDisposable
     {
         // The legacy form-urlencoded POST (no multipart) must keep working unchanged.
         ClaimCallsign("tom", "M0LTE");
-        using HttpClient client = await StartAsync();
+        using HttpClient client = await StartAsync(undoSendSeconds: 0); // route now: assert stored content
 
         HttpResponseMessage response = await client.PostAsync(
             new Uri("/compose", UriKind.Relative),

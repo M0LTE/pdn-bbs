@@ -66,6 +66,14 @@ public sealed record WebmailOptions
     /// Default 256 KiB.
     /// </summary>
     public int MaxUploadBytes { get; init; } = 256 * 1024;
+
+    /// <summary>
+    /// The Gmail-style "undo send" window in seconds: a composed message is deferred (held + hidden,
+    /// not routed) for this long, during which the sender can Undo it; a background worker
+    /// (<see cref="Bbs.Host.PendingSendReleaser"/>) releases + routes it when the window lapses.
+    /// 0 disables the feature — compose routes immediately as it always did. Default 5 seconds.
+    /// </summary>
+    public int UndoSendSeconds { get; init; } = 5;
 }
 
 /// <summary>
@@ -144,8 +152,8 @@ public static class Webmail
         // The BBS home is the status dashboard (queue health + mailbox summary); the inbox is a tab.
         // The PDN nav's "BBS" entry lands here (/apps/bbs/ → /). `notice` shows a one-shot banner,
         // e.g. "Message sent." after composing.
-        app.MapGet("/", (HttpContext ctx, string? notice) => WithCallsign(ctx, options,
-            (prefix, call) => Status(options, prefix, call, Embed(ctx), Theme(ctx), notice)));
+        app.MapGet("/", (HttpContext ctx, string? notice, long? sent) => WithCallsign(ctx, options,
+            (prefix, call) => Status(options, prefix, call, Embed(ctx), Theme(ctx), notice, sent)));
 
         app.MapGet("/inbox", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
             (prefix, call) => Inbox(options, prefix, call, page ?? 1, Embed(ctx), Theme(ctx))));
@@ -194,6 +202,9 @@ public static class Webmail
 
         app.MapPost("/messages/{number:long}/unhold", (HttpContext ctx, long number) => WithCallsign(ctx, options,
             (prefix, call) => Unhold(options, prefix, call, number, Embed(ctx))));
+
+        app.MapPost("/messages/{number:long}/undo-send", (HttpContext ctx, long number) => WithCallsign(ctx, options,
+            (prefix, call) => UndoSend(options, prefix, call, number, Embed(ctx))));
 
         app.MapPost("/claim", async (HttpContext ctx) =>
         {
@@ -436,13 +447,18 @@ public static class Webmail
     /// held / last forwarded), and an attention callout when mail is held. The PDN nav's "BBS" entry
     /// lands here. A read-only summary; the actions live on their own tabs (Inbox, Sent, Forwarding).
     /// </summary>
-    private static IResult Status(WebmailOptions o, string prefix, string call, bool embed, string? theme, string? notice)
+    private static IResult Status(WebmailOptions o, string prefix, string call, bool embed, string? theme, string? notice, long? sent = null)
     {
         (int total, int held) = o.Store.MessageCounts();
         int unread = o.Store.ListMessages(new MessageQuery { Type = MessageType.Personal, ToCall = call, HomedLocally = true })
             .Count(m => m.Recipients.Any(r => Callsigns.BaseEquals(r.ToCall, call) && r.ReadAt is null));
 
+        // The just-composed-message banner (?sent=<n> after a deferred compose): "Message sent — Undo"
+        // with a live countdown while the undo window is still open, else a plain "Message sent." once
+        // released. The ordinary one-shot ?notice= banner is independent (e.g. "Send cancelled.").
+        string sentBanner = sent is { } sentNumber ? SentBanner(o, prefix, sentNumber, embed) : "";
         string banner = notice is null ? "" : Inv($"""<p class="saved">{H(notice)}</p>""");
+        banner = sentBanner + banner;
 
         IReadOnlyList<Partner> partners = o.Store.ListPartners();
 
@@ -481,6 +497,55 @@ public static class Webmail
             """;
         return Html(Page(o, prefix, call, "Status", embed, body, theme));
     }
+
+    /// <summary>
+    /// The "Message sent" banner shown after a deferred compose (home <c>?sent=&lt;n&gt;</c>). While the
+    /// message is still pending (its undo window open) it renders an Undo form (POSTing to
+    /// <c>/messages/{n}/undo-send</c>) plus a tiny countdown — the Undo works server-side without JS
+    /// (the store enforces the window), and a small inline script just ticks the countdown down and, at
+    /// 0, swaps the form for a plain "Message sent." Once released (or unknown) it is just "Message
+    /// sent." The countdown's element ids are namespaced by the message number so two banners never
+    /// collide. Uses the existing <c>saved</c> banner CSS class.
+    /// </summary>
+    private static string SentBanner(WebmailOptions o, string prefix, long number, bool embed)
+    {
+        Message? message = o.Store.GetMessage(number);
+        int remaining = message?.SendReleaseUtc is { } release
+            ? (int)Math.Ceiling((release - o.Store.Now).TotalSeconds)
+            : 0;
+
+        // No longer pending (released, cancelled, or unknown) → just the plain confirmation.
+        if (remaining <= 0)
+        {
+            return """<p class="saved">Message sent.</p>""";
+        }
+
+        string formId = Inv($"undo-{number}");
+        string countId = Inv($"undo-count-{number}");
+        string action = U(prefix, Inv($"/messages/{number}/undo-send"), embed);
+        // The inline countdown script. Built with placeholders + Replace (not interpolation) so its JS
+        // braces don't need escaping; it only ticks the displayed second down and, at 0, swaps the Undo
+        // form for the plain "sent" text. The Undo itself works server-side without JS for the whole
+        // window (the store enforces send_release_utc), so this is presentation only.
+        string script = JsCountdown
+            .Replace("REMAINING", Inv($"{remaining}"), StringComparison.Ordinal)
+            .Replace("COUNTID", countId, StringComparison.Ordinal)
+            .Replace("FORMID", formId, StringComparison.Ordinal);
+
+        // The Undo form (works without JS for the whole window) + a countdown span. data-remaining seeds it.
+        return Inv($"""
+            <p class="saved" id="{formId}">Message sent — <form method="post" action="{action}" style="display:inline">{EmbedField(embed)}<button type="submit" class="link plain">Undo</button></form> <span class="dim">(<span id="{countId}" data-remaining="{remaining}">{remaining}</span>s)</span></p>
+            <p class="saved" id="{formId}-done" style="display:none">Message sent.</p>
+            {script}
+            """);
+    }
+
+    /// <summary>The undo-window countdown script (placeholders REMAINING/COUNTID/FORMID, see <see cref="SentBanner"/>).</summary>
+    private const string JsCountdown =
+        "<script>(function(){var n=REMAINING,c=document.getElementById('COUNTID');" +
+        "var t=setInterval(function(){n--;if(c)c.textContent=n;if(n<=0){clearInterval(t);" +
+        "var a=document.getElementById('FORMID'),b=document.getElementById('FORMID-done');" +
+        "if(a)a.style.display='none';if(b)b.style.display='';}},1000);})();</script>";
 
     private static string BuildForwardingHealth(WebmailOptions o, IReadOnlyList<Partner> partners)
     {
@@ -839,11 +904,45 @@ public static class Webmail
             Body = Encoding.Latin1.GetBytes(crBody),
             Attachments = attachments,
         });
-        o.Routing.RouteMessage(stored);
+
+        if (o.UndoSendSeconds > 0)
+        {
+            // Gmail-style "undo send": defer (hold + hide) the message for the undo window and land on
+            // the home dashboard with ?sent=<n> — which renders the "Message sent — Undo" banner. We do
+            // NOT route here; the background PendingSendReleaser routes it when the window lapses (or it
+            // is cancelled first via /undo-send).
+            o.Store.DeferSend(stored.Number, o.UndoSendSeconds);
+            return Results.Redirect(U(prefix, Inv($"/?sent={stored.Number}"), embed));
+        }
+
+        // Window disabled (UndoSendSeconds == 0): route immediately and confirm, the original behaviour.
         // Back to the BBS home (the status dashboard), where the just-sent message shows up in the
         // forwarding queue, with a confirmation banner — rather than dumping the sender on the raw
         // message view.
+        o.Routing.RouteMessage(stored);
         return Results.Redirect(U(prefix, "/", embed) + Notice(embed, "Message sent."));
+    }
+
+    /// <summary>
+    /// The "undo send" cancel (Gmail-style): cancels a still-pending deferred send if it's the
+    /// caller's own (sender base-equals the caller, or the sysop). Only succeeds within the undo
+    /// window — once the worker has released + routed the message the window has lapsed and this is a
+    /// no-op. Lands back on the home dashboard with a one-shot notice either way.
+    /// </summary>
+    private static IResult UndoSend(WebmailOptions o, string prefix, string call, long number, bool embed)
+    {
+        Message? message = o.Store.GetMessage(number);
+        bool stillPending = message?.SendReleaseUtc is { } release && release > o.Store.Now;
+        bool mine = message is not null && (Callsigns.BaseEquals(message.From, call) || IsSysop(o, call));
+
+        // CancelDeferredSend itself enforces the window server-side (it kills only while the marker is
+        // future), so the Undo link works without JS during the window even if the JS countdown lied.
+        if (stillPending && mine && o.Store.CancelDeferredSend(number))
+        {
+            return Results.Redirect(U(prefix, "/", embed) + Notice(embed, "Send cancelled."));
+        }
+
+        return Results.Redirect(U(prefix, "/", embed) + Notice(embed, "Already sent."));
     }
 
     /// <summary>Strips any directory component from an uploaded filename (both '/' and '\'), defending against a traversal-shaped name.</summary>
@@ -1244,7 +1343,7 @@ public static class Webmail
             <p><label>Max sent <input type="number" name="maxTx" min="0" value="{Inv($"{maxTx}")}" style="width:8rem"> bytes <span class="dim">— largest message proposed to this partner</span></label></p>
             <p><label><input type="checkbox" name="enabled" value="1"{(enabled ? " checked" : "")}> Auto-dial enabled <span class="dim">— off ⇒ messages still queue but aren't dialled out</span></label></p>
             <p><label><input type="checkbox" name="sendImmediately" value="1"{(sendImmediately ? " checked" : "")}> Send immediately <span class="dim">— dial as soon as a message is queued for this partner</span></label></p>
-            <p><label><input type="checkbox" name="collect" value="1"{(collect ? " checked" : "")}> Collect <span class="dim">— poll on the dial cadence even with an empty queue, to pick up mail a partner that can't dial us holds for us</span></label></p>
+            <p><label><input type="checkbox" name="collect" value="1"{(collect ? " checked" : "")}> Collect <span class="dim">— poll on the dial cadence even with an empty queue, to pick up mail a partner that can't dial us holds for us. Note: this GENERATES RF TRAFFIC — it dials on the schedule whether or not there is anything to send.</span></label></p>
             <p><label><input type="checkbox" name="allowB2" value="1"{(allowB2 ? " checked" : "")}> Send binary attachments <span class="dim">— forward file attachments to this partner using the binary "B2" mode (the Winlink/FBB protocol). Leave OFF unless this partner is known to support it (most don't); plain text and 7plus-encoded files forward either way.</span></label></p>
             <p><button type="submit">{(editing ? "Save changes" : "Add partner")}</button> {cancel}</p>
             </fieldset>
@@ -1716,6 +1815,13 @@ public static class Webmail
     /// </summary>
     private static string ForwardStatusBadge(Message message, IReadOnlyList<MessageForward> forwards)
     {
+        // A deferred send in its undo window is Held under the hood, but reads as "sending…" — it isn't
+        // stuck, it's a few seconds from going out (the PendingSendReleaser will route it).
+        if (message.SendReleaseUtc is not null)
+        {
+            return """<span class="badge off">sending…</span>""";
+        }
+
         if (message.Status == MessageStatus.Held)
         {
             return message.HoldReason is { Length: > 0 } reason

@@ -17,7 +17,7 @@ namespace Bbs.Core;
 public sealed class BbsStore : IDisposable
 {
     /// <summary>The schema version this build writes and expects.</summary>
-    public const int CurrentSchemaVersion = 9;
+    public const int CurrentSchemaVersion = 10;
 
     private readonly SqliteConnection _connection;
     private readonly TimeProvider _time;
@@ -38,6 +38,13 @@ public sealed class BbsStore : IDisposable
     public int SchemaVersion { get; }
 
     internal TimeProvider Time => _time;
+
+    /// <summary>
+    /// The store's current UTC instant (the injected <see cref="TimeProvider"/>) — so a UI computing
+    /// "is this deferred send still within its undo window?" uses the SAME clock the store stamps
+    /// <c>send_release_utc</c> with, deterministic under a fake clock in tests.
+    /// </summary>
+    public DateTimeOffset Now => _time.GetUtcNow();
 
     /// <summary>
     /// Opens (creating and/or migrating as needed) the store at <paramref name="path"/>.
@@ -267,7 +274,7 @@ public sealed class BbsStore : IDisposable
         ArgumentNullException.ThrowIfNull(query);
 
         var sql = new System.Text.StringBuilder(
-            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason FROM messages m");
+            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason,m.send_release_utc FROM messages m");
         var parameters = new List<(string Name, object Value)>();
 
         if (query.ToCall is not null)
@@ -470,6 +477,103 @@ public sealed class BbsStore : IDisposable
     }
 
     /// <summary>
+    /// Defers a just-composed message for the webmail "undo send" window: holds it (status → H, so it
+    /// is hidden and unforwarded) AND stamps <c>send_release_utc</c> at <paramref name="windowSeconds"/>
+    /// from now — the instant a release worker (<see cref="ListDueDeferredSends"/> /
+    /// <see cref="ReleaseDeferredSend"/>) clears the marker and routes it. Guarded against K (killed)
+    /// and an already-held message so it can't disturb either.
+    /// </summary>
+    public void DeferSend(long number, int windowSeconds)
+    {
+        long release = NowSeconds() + windowSeconds;
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "UPDATE messages SET status='H', send_release_utc=$r WHERE number=$n AND status NOT IN ('K','H');");
+            cmd.Parameters.AddWithValue("$r", release);
+            cmd.Parameters.AddWithValue("$n", number);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Deferred sends whose undo window has lapsed (<c>send_release_utc</c> set and at or before now) —
+    /// the release worker's work list. Any status (normally H), so a marker stamped before a restart
+    /// is still picked up on the first tick. Caller releases + routes each (<see cref="ReleaseDeferredSend"/>).
+    /// </summary>
+    public IReadOnlyList<Message> ListDueDeferredSends()
+    {
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason,m.send_release_utc " +
+                "FROM messages m WHERE m.send_release_utc IS NOT NULL AND m.send_release_utc<=$now " +
+                "ORDER BY m.number;");
+            cmd.Parameters.AddWithValue("$now", NowSeconds());
+
+            var messages = new List<Message>();
+            using (SqliteDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    messages.Add(ReadMessage(reader));
+                }
+            }
+
+            return AttachRecipients(messages);
+        }
+    }
+
+    /// <summary>
+    /// Releases a deferred send whose window has lapsed: clears the <c>send_release_utc</c> marker and
+    /// unholds the message (H → N, or $ for a bulletin with queued forwards — the same transition as
+    /// <see cref="Unhold"/>) so it re-enters normal routing. The caller then routes it.
+    /// </summary>
+    public void ReleaseDeferredSend(long number)
+    {
+        lock (_gate)
+        {
+            using (SqliteCommand cmd = Command(null,
+                "UPDATE messages SET send_release_utc=NULL WHERE number=$n;"))
+            {
+                cmd.Parameters.AddWithValue("$n", number);
+                cmd.ExecuteNonQuery();
+            }
+
+            using SqliteTransaction tx = _connection.BeginTransaction();
+            (char Type, char Status)? header = GetHeader(tx, number);
+            if (header is { Status: 'H' })
+            {
+                char next = header.Value.Type == 'B' && CountPendingForwards(tx, number) > 0 ? '$' : 'N';
+                SetStatus(tx, number, next, stampKilled: false);
+            }
+
+            tx.Commit();
+        }
+    }
+
+    /// <summary>
+    /// Cancels a deferred send — the webmail "undo": kills it (status → K, kill time stamped) and
+    /// clears the marker, but ONLY while still within the window (<c>send_release_utc</c> set and
+    /// strictly in the future). Returns true when it was cancelled, false when the window had already
+    /// lapsed (the worker may have released + routed it) or it was not a pending send. Authorization
+    /// (sender / sysop) is the caller's job.
+    /// </summary>
+    public bool CancelDeferredSend(long number)
+    {
+        long now = NowSeconds();
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "UPDATE messages SET status='K', killed_utc=$now, send_release_utc=NULL " +
+                "WHERE number=$n AND send_release_utc IS NOT NULL AND send_release_utc>$now;");
+            cmd.Parameters.AddWithValue("$now", now);
+            cmd.Parameters.AddWithValue("$n", number);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
     /// Flags an NTS message delivered (the D command): T only, status → D (compat spec §1.3
     /// "non-T → Message %d not an NTS Message"; §2.2). K/H are not overwritten. Returns false
     /// when missing, not T, or K/H.
@@ -536,7 +640,7 @@ public sealed class BbsStore : IDisposable
         lock (_gate)
         {
             using SqliteCommand cmd = Command(null,
-                "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason " +
+                "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason,m.send_release_utc " +
                 "FROM forwards f JOIN messages m ON m.number=f.message_number " +
                 "WHERE f.partner_call=$p AND f.forwarded_utc IS NULL AND m.status NOT IN ('K','H') " +
                 "ORDER BY CASE m.type WHEN 'T' THEN 0 WHEN 'P' THEN 1 ELSE 2 END, m.number;");
@@ -1859,6 +1963,33 @@ public sealed class BbsStore : IDisposable
             version = 9;
         }
 
+        // v10 — additive only (see Migrate): a nullable send_release_utc on messages. When set, the
+        // message is a pending deferred "undo send" — held (so hidden + unforwarded) until a release
+        // worker stamps it past the marker. Null for every existing row (not a deferred send). No
+        // existing column/row is touched; safe to apply to the live lab bbs.db.
+        if (version < 10)
+        {
+            using SqliteTransaction tx = connection.BeginTransaction();
+
+            if (!ColumnExists(connection, tx, "messages", "send_release_utc"))
+            {
+                using var ddl = connection.CreateCommand();
+                ddl.Transaction = tx;
+                ddl.CommandText = SchemaV10;
+                ddl.ExecuteNonQuery();
+            }
+
+            using (var stamp = connection.CreateCommand())
+            {
+                stamp.Transaction = tx;
+                stamp.CommandText = "UPDATE meta SET value='10' WHERE key='schema_version';";
+                stamp.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            version = 10;
+        }
+
         return version;
     }
 
@@ -2039,6 +2170,13 @@ public sealed class BbsStore : IDisposable
         );
         """;
 
+    // v10 — additive only (see Migrate): a nullable deferred-send release time on messages. Set by a
+    // webmail compose with the undo-send window enabled — the message is held until this instant, when
+    // the release worker clears the marker and routes it; null means it is not a deferred send.
+    private const string SchemaV10 = """
+        ALTER TABLE messages ADD COLUMN send_release_utc INTEGER;
+        """;
+
     private void InsertRecipient(SqliteTransaction tx, long number, string toCall, bool cc)
     {
         using SqliteCommand cmd = Command(tx,
@@ -2060,7 +2198,7 @@ public sealed class BbsStore : IDisposable
     private Message? GetMessageCore(long number)
     {
         using SqliteCommand cmd = Command(null,
-            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason " +
+            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason,m.send_release_utc " +
             "FROM messages m WHERE m.number=$n;");
         cmd.Parameters.AddWithValue("$n", number);
 
@@ -2134,6 +2272,7 @@ public sealed class BbsStore : IDisposable
             KilledAt = reader.IsDBNull(10) ? null : DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(10)),
             LocalOnly = reader.GetInt64(11) != 0,
             HoldReason = reader.IsDBNull(12) ? null : reader.GetString(12),
+            SendReleaseUtc = reader.IsDBNull(13) ? null : DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(13)),
         };
     }
 

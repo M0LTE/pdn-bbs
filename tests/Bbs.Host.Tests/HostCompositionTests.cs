@@ -29,9 +29,9 @@ public sealed class HostCompositionTests
         List<IHostedService> components = [.. host.App.Services.GetServices<IHostedService>()
             .Where(s => s.GetType().Name.StartsWith("ComponentService", StringComparison.Ordinal))];
 
-        // rhp-link + demux + forwarding + housekeeping. Before the fix this was 1 (rhp-link).
-        Assert.Equal(4, components.Count);
-        Assert.Equal(4, components.Select(s => s.GetType()).Distinct().Count());
+        // rhp-link + demux + forwarding + housekeeping + pending-send. Before the fix this was 1 (rhp-link).
+        Assert.Equal(5, components.Count);
+        Assert.Equal(5, components.Select(s => s.GetType()).Distinct().Count());
     }
 
     [Fact]

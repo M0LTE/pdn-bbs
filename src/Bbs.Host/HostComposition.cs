@@ -140,6 +140,8 @@ public static class HostComposition
             sp.GetRequiredService<ILogger<InboundDemux>>()));
         builder.Services.AddSingleton(sp => new HousekeepingRunner(
             store, new HousekeepingPolicy(), time, sp.GetRequiredService<ILogger<HousekeepingRunner>>()));
+        builder.Services.AddSingleton(sp => new PendingSendReleaser(
+            store, sp.GetRequiredService<RoutingService>(), time, sp.GetRequiredService<ILogger<PendingSendReleaser>>()));
 
         // The optional IMAP server (default off): registered only when enabled, so a node that does
         // not configure it constructs nothing and behaves exactly as before. The self-signed TLS cert
@@ -202,6 +204,8 @@ public static class HostComposition
             sp.GetRequiredService<ForwardingScheduler>(), static (scheduler, ct) => scheduler.RunAsync(ct)));
         builder.Services.AddHostedService(sp => new ComponentService<HousekeepingRunner>("housekeeping",
             sp.GetRequiredService<HousekeepingRunner>(), static (runner, ct) => runner.RunAsync(ct)));
+        builder.Services.AddHostedService(sp => new ComponentService<PendingSendReleaser>("pending-send",
+            sp.GetRequiredService<PendingSendReleaser>(), static (releaser, ct) => releaser.RunAsync(ct)));
 
         // The IMAP accept loop is hosted only when the (default-off) IMAP server was registered above.
         if (config.Imap.Enabled)

@@ -98,6 +98,15 @@ public sealed record Message
     public string? HoldReason { get; init; }
 
     /// <summary>
+    /// When set, this message is a PENDING DEFERRED SEND awaiting its undo window: the UTC instant
+    /// at which a background release worker should clear the marker and route it. While set the
+    /// message is also <see cref="MessageStatus.Held"/>, so it stays hidden (out of inboxes,
+    /// bulletins and forward queues) and unsendable until released — the "undo send" window during
+    /// which the sender can cancel it. Null for every normal message (not a deferred send). (schema v10)
+    /// </summary>
+    public DateTimeOffset? SendReleaseUtc { get; init; }
+
+    /// <summary>
     /// All recipients (To and Cc). A multi-recipient message (S-line recipients separated by ';',
     /// compat spec §1.5, or a B2 message's repeated <c>To:</c>/<c>Cc:</c> lines, spec §3.9) is
     /// stored once with one row per recipient so it lists per-user; <see cref="MessageRecipient.Cc"/>
