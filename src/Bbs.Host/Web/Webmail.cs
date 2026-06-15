@@ -834,25 +834,149 @@ public static class Webmail
             """;
     }
 
+    // The webmail's self-contained stylesheet, restyled to mirror the PDN control panel's design
+    // system (web/packetnet-ui — shadcn-flavoured Tailwind). The colour tokens are PDN's exact HSL
+    // triplets, exposed here as CSS variables consumed via hsl(var(--token)) — light under :root,
+    // dark under the SAME values PDN uses for .dark. Because the panel renders us in a borderless
+    // iframe (a separate document that cannot see the parent's .dark class), we auto-blend with the
+    // panel's active theme through prefers-color-scheme; a .dark class on <html> is also honoured for
+    // robustness. Fonts, radii, and the button/input/card/table/tab/badge/link looks track PDN's
+    // ui/index.tsx primitives. NOT loaded from PDN's compiled bundle at runtime (cross-repo/hashed) —
+    // this is deliberately standalone so it renders cleanly both in-panel and on its own.
     private const string Style = """
         <style>
-        body{font-family:system-ui,sans-serif;margin:0;background:#f4f3ef;color:#1c1c1a}
+        :root{
+          --background:0 0% 100%;--foreground:222 24% 12%;
+          --card:0 0% 100%;--card-foreground:222 24% 12%;
+          --primary:200 92% 44%;--primary-foreground:0 0% 100%;
+          --secondary:220 14% 96%;--secondary-foreground:222 24% 12%;
+          --muted:220 14% 96%;--muted-foreground:220 9% 46%;
+          --accent:220 14% 94%;--accent-foreground:222 24% 12%;
+          --border:220 13% 90%;--input:220 13% 88%;--ring:200 92% 44%;
+          --success:152 58% 40%;--warning:33 92% 45%;--danger:0 72% 50%;
+          --radius:0.5rem;
+        }
+        .dark{
+          --background:220 26% 7%;--foreground:210 22% 92%;
+          --card:220 23% 9.5%;--card-foreground:210 22% 92%;
+          --primary:199 89% 52%;--primary-foreground:220 40% 8%;
+          --secondary:220 18% 14%;--secondary-foreground:210 22% 92%;
+          --muted:220 18% 14%;--muted-foreground:218 12% 58%;
+          --accent:220 18% 16%;--accent-foreground:210 22% 92%;
+          --border:220 16% 17%;--input:220 16% 19%;--ring:199 89% 52%;
+          --success:152 56% 46%;--warning:38 92% 52%;--danger:0 74% 56%;
+        }
+        @media (prefers-color-scheme:dark){
+          :root:not(.light){
+            --background:220 26% 7%;--foreground:210 22% 92%;
+            --card:220 23% 9.5%;--card-foreground:210 22% 92%;
+            --primary:199 89% 52%;--primary-foreground:220 40% 8%;
+            --secondary:220 18% 14%;--secondary-foreground:210 22% 92%;
+            --muted:220 18% 14%;--muted-foreground:218 12% 58%;
+            --accent:220 18% 16%;--accent-foreground:210 22% 92%;
+            --border:220 16% 17%;--input:220 16% 19%;--ring:199 89% 52%;
+            --success:152 56% 46%;--warning:38 92% 52%;--danger:0 74% 56%;
+          }
+        }
+        *{box-sizing:border-box}
+        html{scrollbar-width:thin;scrollbar-color:hsl(var(--border)) transparent}
+        ::-webkit-scrollbar{width:10px;height:10px}
+        ::-webkit-scrollbar-thumb{background-color:hsl(var(--border));border-radius:9999px;border:2px solid transparent;background-clip:content-box}
+        body{
+          font-family:Inter,ui-sans-serif,system-ui,sans-serif;margin:0;
+          background:hsl(var(--background));color:hsl(var(--foreground));
+          font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+        }
         main{max-width:60rem;margin:0 auto;padding:1.5rem}
-        h1{font-size:1.3rem}h1 .dim,nav .dim,h2 .dim{color:#8a857c;font-weight:normal}
-        nav{margin-bottom:1rem}
-        table{border-collapse:collapse;width:100%}
-        th,td{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #ddd8cf;font-size:.92rem}
-        tr.unread td{font-weight:bold}
-        pre{background:#fff;border:1px solid #ddd8cf;padding:1rem;white-space:pre-wrap;word-break:break-word}
-        table.meta th{width:6rem;color:#8a857c;font-weight:normal}
-        .err{color:#a32014}.saved{color:#1a6b2f}.pager{margin-top:.75rem}
-        fieldset{border:1px solid #ddd8cf;margin:0 0 1rem;padding:.5rem 1rem}legend{color:#8a857c}
-        ul.attachments{padding-left:1.2rem}ul.attachments .dim{color:#8a857c}
+        h1{font-size:1.25rem;font-weight:600;letter-spacing:-.01em;margin:0 0 1rem}
+        h2{font-size:1.05rem;font-weight:600;margin:0 0 .75rem}
+        h3{font-size:.9rem;font-weight:600;margin:1.25rem 0 .5rem}
+        .dim,h1 .dim,nav .dim,h2 .dim{color:hsl(var(--muted-foreground));font-weight:400}
+        a{color:hsl(var(--primary));text-decoration:none}
+        a:hover{text-decoration:underline}
+        nav{
+          display:flex;flex-wrap:wrap;align-items:center;gap:.25rem;
+          margin:0 0 1.25rem;padding:.25rem;border-radius:var(--radius);
+          background:hsl(var(--muted));font-size:.8rem;
+        }
+        nav a{
+          padding:.3rem .7rem;border-radius:calc(var(--radius) - 2px);
+          color:hsl(var(--muted-foreground));font-weight:500;text-decoration:none;
+          transition:color .15s,background-color .15s;
+        }
+        nav a:hover{color:hsl(var(--foreground));text-decoration:none}
+        nav .dim{margin-left:auto;padding:0 .5rem}
+        table{border-collapse:collapse;width:100%;font-size:.875rem}
+        th{
+          text-align:left;padding:.4rem .6rem;border-bottom:1px solid hsl(var(--border));
+          font-size:.6875rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+          color:hsl(var(--muted-foreground));
+        }
+        td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid hsl(var(--border));vertical-align:top}
+        tr.unread td{font-weight:600}
+        tbody tr:hover td,table tr:hover td{background:hsl(var(--accent)/.5)}
+        pre{
+          background:hsl(var(--card));border:1px solid hsl(var(--border));
+          border-radius:var(--radius);padding:1rem;white-space:pre-wrap;word-break:break-word;
+          font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;font-size:.85rem;line-height:1.55;
+        }
+        table.meta{width:auto}
+        table.meta th{
+          width:6rem;text-transform:none;letter-spacing:0;font-size:.8rem;font-weight:500;
+          color:hsl(var(--muted-foreground));border-bottom:0;padding:.2rem .6rem .2rem 0;vertical-align:top;
+        }
+        table.meta td{border-bottom:0;padding:.2rem 0}
+        table.meta tr:hover td{background:none}
+        .err{
+          color:hsl(var(--danger));background:hsl(var(--danger)/.1);
+          border-radius:calc(var(--radius) - 2px);padding:.5rem .75rem;margin:.75rem 0;font-size:.875rem;
+        }
+        .saved{
+          color:hsl(var(--success));background:hsl(var(--success)/.12);
+          border-radius:calc(var(--radius) - 2px);padding:.5rem .75rem;margin:.75rem 0;font-size:.875rem;
+        }
+        p.dim{margin:.5rem 0}
+        .pager{margin-top:1rem;font-size:.875rem;display:flex;gap:1rem}
+        form{margin:0 0 1rem}
+        fieldset{
+          border:1px solid hsl(var(--border));border-radius:var(--radius);
+          margin:0 0 1rem;padding:1rem 1.25rem;background:hsl(var(--card));
+        }
+        legend{padding:0 .4rem;color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:600}
+        label{display:inline-block}
+        ul.attachments{padding-left:1.2rem;font-size:.875rem}
+        ul.attachments .dim{color:hsl(var(--muted-foreground))}
         ul.sevenplus-pending{list-style:none;padding:0;margin:0 0 1rem}
-        ul.sevenplus-pending li{padding:.3rem .6rem;border:1px dashed #c9c3b8;background:#fbfaf6;border-radius:3px;margin-bottom:.3rem;font-size:.92rem}
-        input,select,textarea{font:inherit}
-        button{font:inherit;padding:.2rem .8rem}
-        button.link{padding:0;border:0;background:none;color:#a32014;text-decoration:underline;cursor:pointer}
+        ul.sevenplus-pending li{
+          padding:.5rem .75rem;border:1px dashed hsl(var(--border));background:hsl(var(--muted)/.5);
+          border-radius:calc(var(--radius) - 2px);margin-bottom:.4rem;font-size:.875rem;color:hsl(var(--foreground));
+        }
+        input,select,textarea{
+          font:inherit;color:hsl(var(--foreground));background:hsl(var(--background));
+          border:1px solid hsl(var(--input));border-radius:calc(var(--radius) - 2px);
+          padding:.4rem .6rem;font-size:.875rem;transition:border-color .15s,box-shadow .15s;
+        }
+        input[type=radio],input[type=checkbox]{
+          border-radius:0;padding:0;accent-color:hsl(var(--primary));vertical-align:middle;margin-right:.35rem;
+        }
+        input[type=file]{border:0;padding:.2rem 0;background:none}
+        textarea{width:100%;max-width:100%;font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;line-height:1.55}
+        input:focus,select:focus,textarea:focus{
+          outline:none;border-color:hsl(var(--ring));box-shadow:0 0 0 2px hsl(var(--ring)/.35);
+        }
+        button{
+          font:inherit;font-weight:500;font-size:.875rem;cursor:pointer;
+          padding:.45rem 1rem;border-radius:calc(var(--radius) - 2px);border:1px solid transparent;
+          background:hsl(var(--primary));color:hsl(var(--primary-foreground));
+          box-shadow:0 1px 2px 0 hsl(220 26% 7%/.06);transition:background-color .15s,box-shadow .15s;
+        }
+        button:hover{background:hsl(var(--primary)/.9)}
+        button:focus-visible{outline:none;box-shadow:0 0 0 2px hsl(var(--background)),0 0 0 4px hsl(var(--ring))}
+        button.link{
+          padding:0;border:0;background:none;box-shadow:none;font-weight:400;
+          color:hsl(var(--danger));text-decoration:underline;
+        }
+        button.link:hover{background:none;color:hsl(var(--danger)/.85)}
         </style>
         """;
 
