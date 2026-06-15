@@ -432,9 +432,14 @@ public static class Webmail
         string to = string.Join("; ", message.Recipients.Where(r => !r.Cc).Select(r => r.ToCall));
         string ccRow = RenderCcRow(message);
         string attachments = RenderAttachments(message, prefix, embed);
+        // Contextual back link to the list this message came from (personals → Inbox, else Bulletins),
+        // so a reader isn't stranded on the message with only the top nav to escape.
+        string backPath = message.Type == MessageType.Personal ? "/" : "/bulletins";
+        string backLabel = message.Type == MessageType.Personal ? "Inbox" : "Bulletins";
         return Html(Page(o, prefix, call, Inv($"Message {message.Number}"), embed,
             $"""
-            <h2>Message {message.Number} <span class="dim">[{H(message.Type.ToCode().ToString())}/{H(message.Status.ToCode().ToString())}]</span></h2>
+            <p class="back"><a href="{U(prefix, backPath, embed)}">&laquo; Back to {backLabel}</a></p>
+            <h2>Message {message.Number} <span class="dim">— {H(TypeWord(message.Type))} · {H(StatusWord(message.Status))}</span></h2>
             <table class="meta">
             <tr><th>From</th><td>{H(message.From)}</td></tr>
             <tr><th>To</th><td>{H(to)}{(message.At is null ? "" : " @ " + H(message.At))}</td></tr>
@@ -983,6 +988,26 @@ public static class Webmail
         return sb.ToString();
     }
 
+    /// <summary>Plain-language message type for the reader — no terse wire letters (P/B/T).</summary>
+    private static string TypeWord(MessageType type) => type switch
+    {
+        MessageType.Personal => "Personal",
+        MessageType.Bulletin => "Bulletin",
+        MessageType.Traffic => "NTS traffic",
+        _ => type.ToString(),
+    };
+
+    /// <summary>Plain-language message status for the reader — replaces the archaic N/Y/$/F/K codes.</summary>
+    private static string StatusWord(MessageStatus status) => status switch
+    {
+        MessageStatus.Unread => "Unread",
+        MessageStatus.Read => "Read",
+        MessageStatus.BulletinQueued => "Queued to forward",
+        MessageStatus.Forwarded => "Forwarded",
+        MessageStatus.Killed => "Killed",
+        _ => status.ToString(),
+    };
+
     private static string MessageRows(IReadOnlyList<Message> messages, int page, int pageSize, string call, string prefix, string basePath, bool embed)
     {
         page = Math.Max(1, page);
@@ -993,14 +1018,18 @@ public static class Webmail
         }
 
         var sb = new StringBuilder();
-        sb.Append("<table><tr><th>#</th><th>St</th><th>From</th><th>To</th><th>Date</th><th>Subject</th></tr>");
+        sb.Append("<table><tr><th>#</th><th class=\"read-col\"></th><th>From</th><th>To</th><th>Date</th><th>Subject</th></tr>");
         foreach (Message m in slice)
         {
             bool unreadByMe = m.Recipients.Any(r =>
                 Callsigns.BaseEquals(r.ToCall, call) && r.ReadAt is null);
+            // A clear read/unread marker (a dot) in place of the terse status code. unreadByMe is a
+            // per-addressee fact, so it lights only for a personal addressed to this user; bulletins
+            // (no matching recipient) carry no dot.
+            string readDot = unreadByMe ? """<span class="unread-dot" title="Unread">&#9679;</span>""" : "";
             string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}"), embed)}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
             sb.Append(Inv($"<tr{(unreadByMe ? " class=\"unread\"" : "")}><td>{m.Number}</td>"))
-              .Append(Inv($"<td>{H(m.Status.ToCode().ToString())}</td><td>{H(m.From)}</td>"))
+              .Append(Inv($"<td class=\"read-col\">{readDot}</td><td>{H(m.From)}</td>"))
               .Append(Inv($"<td>{H(string.Join(";", m.Recipients.Where(r => !r.Cc).Select(r => r.ToCall)))}{(m.At is null ? "" : "@" + H(m.At))}</td>"))
               .Append(Inv($"<td>{H(m.CreatedAt.ToString("yyMMdd", CultureInfo.InvariantCulture))}</td><td>{subject}</td></tr>"));
         }
@@ -1133,6 +1162,9 @@ public static class Webmail
         }
         td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid hsl(var(--border));vertical-align:top}
         tr.unread td{font-weight:600}
+        th.read-col,td.read-col{width:1.4rem;text-align:center;padding-left:0;padding-right:.2rem}
+        .unread-dot{color:hsl(var(--primary));font-size:.7rem;line-height:1}
+        .back{margin:0 0 .85rem;font-size:.8rem}
         tbody tr:hover td,table tr:hover td{background:hsl(var(--accent)/.5)}
         pre{
           background:hsl(var(--card));border:1px solid hsl(var(--border));

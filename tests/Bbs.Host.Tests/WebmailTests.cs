@@ -1328,6 +1328,69 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.Contains("claim", page, StringComparison.OrdinalIgnoreCase);
     }
 
+    // ------------------------------------------------ message-view + listing UX
+
+    [Fact]
+    public async Task ReadMessage_ShowsPlainTypeAndStatus_AndABackLink()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Bulletin,
+            From = "G8ABC",
+            Recipients = ["PACKET"],
+            Subject = "Plain header",
+            Body = Encoding.Latin1.GetBytes("hi\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        // Plain words for the reader — not the archaic [B/...] wire codes.
+        Assert.Contains("Bulletin", page, StringComparison.Ordinal);
+        Assert.DoesNotContain("[B/", page, StringComparison.Ordinal);
+        // A contextual back link to the list it belongs to (a bulletin → Bulletins).
+        Assert.Contains("Back to Bulletins", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadMessage_PersonalLinksBackToTheInbox()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "G8ABC",
+            Recipients = ["M0LTE"],
+            Subject = "for me",
+            Body = Encoding.Latin1.GetBytes("hi\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        Assert.Contains("Back to Inbox", page, StringComparison.Ordinal);
+        Assert.Contains("Personal", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Inbox_MarksUnreadPersonalsWithAReadIndicator_NotTheTerseCodeColumn()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "G8ABC",
+            Recipients = ["M0LTE"],
+            Subject = "Unread one",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string inbox = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+        Assert.Contains("unread-dot", inbox, StringComparison.Ordinal);        // the clear read/unread marker
+        Assert.Contains("class=\"unread\"", inbox, StringComparison.Ordinal);  // the row is bold-flagged
+        Assert.DoesNotContain(">St<", inbox, StringComparison.Ordinal);        // the archaic status-code column is gone
+    }
+
     // ------------------------------------------------ forwarding view (sysop, read-only)
     // A sysop-only, read-only picture of how mail leaves this BBS: one panel per configured partner
     // with its dial config, the LIVE forward-queue depth, and the routing rules translated out of FBB
