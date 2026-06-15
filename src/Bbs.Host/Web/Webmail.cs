@@ -595,7 +595,7 @@ public static class Webmail
             <option value="B"{(bulletin ? " selected" : "")}>Bulletin</option>
             </select></label></p>
             <p><label>To <input name="to" value="{H(to ?? "")}" placeholder="callsign or topic" required></label>
-            <label>@ <input name="at" placeholder="route, e.g. GB7BPQ.#23.GBR.EURO or EURO"></label></p>
+            <label>@ <input name="at" placeholder="route, e.g. GB7AAA.#23.GBR.EURO or EURO"></label></p>
             <p><label>Subject <input name="subject" size="60" maxlength="60" required></label></p>
             <p><textarea name="body" rows="12" cols="72"></textarea></p>
             <fieldset><legend>Attach a file <span class="dim">(optional)</span></legend>
@@ -1048,7 +1048,7 @@ public static class Webmail
         string title = editing ? Inv($"Edit {H(partner!.Call)}") : "Add partner";
         string callField = editing
             ? Inv($"""<input type="hidden" name="call" value="{H(partner!.Call)}"><b>{H(partner.Call)}</b> <span class="dim">— the partner's callsign can't be changed; delete and re-add to rename.</span>""")
-            : """<input name="call" placeholder="e.g. GB7BPQ" maxlength="9" required>""";
+            : """<input name="call" placeholder="e.g. GB7AAA" maxlength="9" required>""";
 
         string script = editing ? string.Join("\n", partner!.ConnectScript) : "";
         string to = editing ? string.Join(" ", partner!.ToCalls) : "";
@@ -1073,16 +1073,16 @@ public static class Webmail
             <fieldset>
             <legend>{H(title)}</legend>
             <p><label>Partner callsign<br>{callField}</label></p>
-            <p><label>Connect script <span class="dim">— one line each. The first line names the dial (e.g. <code>C GB7BPQ</code>). Later lines are <code>EXPECT=SEND</code> steps: wait for the text before the <code>=</code> on the link, then send the text after it — e.g. <code>GB7RDG&gt;=BBS</code> waits for the node prompt, then sends <code>BBS</code>. A line with no <code>=</code> is send-only (no wait), e.g. <code>BBS</code></span><br>
-            <textarea name="connectScript" rows="3" cols="48" placeholder="C GB7BPQ">{H(script)}</textarea></label></p>
+            <p><label>Connect script <span class="dim">— one line each. The first line names the dial (e.g. <code>C GB7AAA</code>). Later lines are <code>EXPECT=SEND</code> steps: wait for the text before the <code>=</code> on the link, then send the text after it — e.g. <code>GB7RDG&gt;=BBS</code> waits for the node prompt, then sends <code>BBS</code>. A line with no <code>=</code> is send-only (no wait), e.g. <code>BBS</code></span><br>
+            <textarea name="connectScript" rows="3" cols="48" placeholder="C GB7AAA">{H(script)}</textarea></label></p>
             <p><label>@ addresses <span class="dim">— routes this partner serves; <code>*</code> is the catch-all default uplink (space-separated)</span><br>
-            <input name="at" size="48" value="{H(at)}" placeholder="* or GB7BPQ"></label></p>
+            <input name="at" size="48" value="{H(at)}" placeholder="* or GB7AAA"></label></p>
             <p><label>Specific recipients <span class="dim">— send mail addressed TO any of these callsigns out via this partner: a per-user override for when a particular person's mail should always take this link. Usually left empty — the @ address and areas below do the routing. Space-separated.</span><br>
             <input name="to" size="48" value="{H(to)}" placeholder="(usually empty)"></label></p>
             <p><label>Areas <span class="dim">— the hierarchical regions this partner relays. A bulletin or message whose <code>@</code> address falls under one of these (e.g. <code>GBR.EURO</code>, or just <code>EURO</code>) is forwarded to this partner. Space-separated.</span><br>
             <input name="hr" size="48" value="{H(hr)}" placeholder="GBR.EURO"></label></p>
-            <p><label>Partner address <span class="dim">— the partner's own full HA, needed for flood matching, e.g. <code>GB7BPQ.#23.GBR.EURO</code></span><br>
-            <input name="bbsHa" size="48" value="{H(bbsHa)}" placeholder="GB7BPQ.#23.GBR.EURO"></label></p>
+            <p><label>Partner address <span class="dim">— the partner's own full HA, needed for flood matching, e.g. <code>GB7AAA.#23.GBR.EURO</code></span><br>
+            <input name="bbsHa" size="48" value="{H(bbsHa)}" placeholder="GB7AAA.#23.GBR.EURO"></label></p>
             <p><label>Dial every <input type="number" name="intervalMinutes" min="1" value="{Inv($"{interval}")}" style="width:6rem"> minutes <span class="dim">— retry cadence for queued mail</span></label></p>
             <p><label>Connect timeout <input type="number" name="conTimeoutSeconds" min="1" value="{Inv($"{conTimeout}")}" style="width:6rem"> seconds <span class="dim">— per response wait during the connect handshake</span></label></p>
             <p><label>Max accepted <input type="number" name="maxRx" min="0" value="{Inv($"{maxRx}")}" style="width:8rem"> bytes <span class="dim">— largest message accepted from this partner</span></label></p>

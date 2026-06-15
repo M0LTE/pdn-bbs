@@ -684,7 +684,7 @@ public static class BbsHostConfigFile
         #   at:              AT-field list; "*" entries are the wildcard default route
         #   hr:              hierarchical routes, e.g. [GBR.EURO] (flood matching also
         #                    needs bbsHa — the partner's own full HA)
-        #   bbsHa:           partner's full HA, e.g. GB7BPQ.#23.GBR.EURO
+        #   bbsHa:           partner's full HA, e.g. GB7AAA.#23.GBR.EURO
         #   maxRx / maxTx:   per-partner inbound/outbound size caps in bytes (default 99999)
         #   enabled:         auto-dialling on/off (messages still queue when off)
         #   allowB2:         opt in to B2F (Winlink/FBB B2) with this partner (default false).
@@ -693,13 +693,13 @@ public static class BbsHostConfigFile
         #                    exchange FC (B2 objects) instead of FA/B1. Only flip it for a
         #                    partner that wants B2 (e.g. a Winlink RMS gateway).
         partners: []
-        #  - call: GB7BPQ
-        #    connect: GB7BPQ
+        #  - call: GB7AAA
+        #    connect: GB7AAA
         #    intervalMinutes: 60
         #    sendImmediately: true
         #    at: ["*"]
         #    hr: [GBR.EURO]
-        #    bbsHa: GB7BPQ.#23.GBR.EURO
+        #    bbsHa: GB7AAA.#23.GBR.EURO
         #  - call: GB7RDG
         #    connectScript:        # dial the node, then enter its BBS application
         #      - C GB7RDG
