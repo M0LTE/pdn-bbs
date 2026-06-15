@@ -12,8 +12,12 @@ namespace Bbs.Core;
 public sealed record Partner
 {
     /// <summary>
-    /// Partner identity: exact callsign <b>including SSID</b> — inbound forwarding connects are
-    /// matched "by exact source callsign including SSID" (compat spec §2.5 [M0LTE-IT]).
+    /// Partner identity: the partner node's callsign. Conventionally the base callsign (no SSID).
+    /// Inbound forwarding connects are matched on the <b>base</b> callsign (SSID-agnostic, via
+    /// <see cref="BbsStore.FindPartnerByBaseCall"/>): the source SSID of an inbound connect is
+    /// indeterminate — an outbound AX.25 connect grabs whatever SSID is free at the time — so it
+    /// cannot be relied on to route to the BBS. (Supersedes the earlier "exact source callsign
+    /// including SSID" reading, compat spec §2.5 [M0LTE-IT], which assumed a stable source SSID.)
     /// </summary>
     public required string Call { get; init; }
 

@@ -238,7 +238,8 @@ public sealed record RhpConfig
 /// </summary>
 public sealed record PartnerConfig
 {
-    /// <summary>Partner callsign, exact incl. SSID (inbound match is by exact source call — compat spec §2.5).</summary>
+    /// <summary>Partner node callsign (conventionally base, no SSID). Inbound match is on the BASE
+    /// callsign (SSID-agnostic) — an inbound connect's source SSID is indeterminate, so it can't key the match.</summary>
     public string Call { get; init; } = "";
 
     /// <summary>
@@ -638,7 +639,7 @@ public static class BbsHostConfigFile
         # turn, and vice versa; oracle-proven both ways). intervalMinutes is only the
         # RETRY cadence for mail that could not be delivered — the BBS never dials an
         # empty queue, so a quiet link stays quiet. No polling timers to tune.
-        #   call:            partner callsign, exact incl. SSID (inbound match is exact)
+        #   call:            partner node callsign (base, no SSID; inbound match is SSID-agnostic)
         #   connect:         simple connect form — the callsign/alias outbound cycles
         #                    dial (default: call). Equivalent to a one-line script
         #                    "C <call>".

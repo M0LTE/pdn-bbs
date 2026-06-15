@@ -66,6 +66,43 @@ public class InboundForwardingTests
     }
 
     [Fact]
+    public async Task InboundFromADifferentSourceSsid_IsStillMatchedToThePartner()
+    {
+        // The source SSID of an inbound connect is indeterminate (the caller grabs whatever SSID is
+        // free), so a partner is matched on the BASE callsign. A caller from GB7BPQ-14 is the GB7BPQ
+        // partner: the stored message's ReceivedFrom is the partner's CONFIGURED call ("GB7BPQ"), not
+        // the raw "-14" source — which is the value it would carry had the match fallen through to the
+        // literal source (the old exact-incl-SSID behaviour this fixes).
+        await using var host = new HostHarness();
+        host.Store.UpsertPartner(new Partner { Call = "GB7BPQ" });
+        await host.StartLinkAsync();
+        host.StartDemux();
+
+        FakeRhpPeer peer = await host.Server.AcceptChildAsync("GB7BPQ-14");
+        await peer.SendLineAsync(PeerSid);
+        Assert.Equal("[PDN-0.1.0-B1FHM$]", await peer.ReadLineAsync());
+        Assert.Equal("de GB7PDN>", await peer.ReadLineAsync());
+
+        const string body = "R:260611/1000Z 44@GB7BPQ.#23.GBR.EURO BPQ6.0.24\r\rHi.\r";
+        string proposal = string.Create(
+            CultureInfo.InvariantCulture, $"FA P M0XYZ GB7PDN G8ABC 777_GB7BPQ {body.Length}");
+        await peer.SendLineAsync(proposal);
+        await peer.SendLineAsync(ProposalBlock.BuildTerminator(ProposalBlock.ComputeChecksum([proposal])));
+        Assert.Equal("FS +", await peer.ReadLineAsync());
+
+        byte[] wire = BlockFraming.EncodeMessage(
+            "Subj", 0, LzhufContainer.Encode(LzhufContainerKind.B1, Encoding.Latin1.GetBytes(body)));
+        await peer.SendBytesAsync(wire);
+        Assert.Equal("FF", await peer.ReadLineAsync());
+        await peer.SendLineAsync("FQ");
+        await peer.WaitForHostCloseAsync();
+
+        Message stored = Assert.Single(host.Store.ListMessages(new MessageQuery()));
+        Assert.Equal("GB7BPQ", stored.ReceivedFrom);                            // the partner, not "GB7BPQ-14"
+        Assert.Equal("GB7BPQ", host.Store.LookupBid("777_GB7BPQ")!.FirstSeenFrom);
+    }
+
+    [Fact]
     public async Task RoutesGenuinelyOnward_WhenInboundIsAddressedElsewhere()
     {
         // Companion to the test above: an inbound personal whose AT is NOT us and whose TO is

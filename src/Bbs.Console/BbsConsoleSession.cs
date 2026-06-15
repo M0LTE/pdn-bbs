@@ -63,9 +63,10 @@ public sealed partial class BbsConsoleSession
         _isSysop = config.SysopCallsigns.Any(s => Callsigns.BaseEquals(s, terminal.RemoteCallsign));
 
         // The BBS user flag (compat spec §2.5) gates `< from` and the MBL-style S responses
-        // (§1.5/§3.10). A caller is BBS-flagged when a partner record exists for its exact
-        // connected callsign incl. SSID ("matched by exact source callsign including SSID").
-        _isBbs = store.GetPartner(terminal.RemoteCallsign) is not null;
+        // (§1.5/§3.10), and suppresses the new-user "Please enter your Name" greeting for a peer
+        // BBS. Matched on the BASE callsign (like _isSysop above): the source SSID of an inbound
+        // connect is indeterminate, so a partner connecting from any SSID must still be BBS-flagged.
+        _isBbs = store.FindPartnerByBaseCall(terminal.RemoteCallsign) is not null;
 
         UserSettings settingsRecord = settings.Load(_userCall);
         _expert = settingsRecord.Expert ?? config.ExpertDefault;

@@ -451,4 +451,30 @@ public sealed class BbsStoreTests : IDisposable
         Assert.True(_ts.Store.DeletePartner("gb7aaa"));
         Assert.Null(_ts.Store.GetPartner("GB7AAA"));
     }
+
+    [Fact]
+    public void FindPartnerByBaseCall_MatchesAnySsid_OfTheInboundSource()
+    {
+        // A partner is keyed by its node (base) callsign; an inbound connect's source SSID is
+        // indeterminate, so the match must ignore it.
+        _ts.Store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
+
+        // Any SSID of the same base call matches — incl. the high SSIDs an outbound connect grabs.
+        Assert.Equal("GB7RDG", _ts.Store.FindPartnerByBaseCall("GB7RDG")?.Call);
+        Assert.Equal("GB7RDG", _ts.Store.FindPartnerByBaseCall("GB7RDG-14")?.Call);
+        Assert.Equal("GB7RDG", _ts.Store.FindPartnerByBaseCall("GB7RDG-1")?.Call);
+        Assert.Equal("GB7RDG", _ts.Store.FindPartnerByBaseCall("gb7rdg-7")?.Call); // case-insensitive
+
+        // A different base callsign does not match.
+        Assert.Null(_ts.Store.FindPartnerByBaseCall("GB7BPQ-14"));
+    }
+
+    [Fact]
+    public void FindPartnerByBaseCall_MatchesWhenThePartnerItselfWasConfiguredWithAnSsid()
+    {
+        // Even an oddly SSID'd partner config matches inbound on the base call (SSID ignored both ways).
+        _ts.Store.UpsertPartner(new Partner { Call = "GB7RDG-2" });
+        Assert.Equal("GB7RDG-2", _ts.Store.FindPartnerByBaseCall("GB7RDG")?.Call);
+        Assert.Equal("GB7RDG-2", _ts.Store.FindPartnerByBaseCall("GB7RDG-9")?.Call);
+    }
 }

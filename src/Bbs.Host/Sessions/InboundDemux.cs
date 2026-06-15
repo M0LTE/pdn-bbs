@@ -118,11 +118,13 @@ public sealed class InboundDemux
             //
             // The caller is known at accept time, so we advertise B2F ('2') in this greeting
             // SID ONLY when this caller matches a partner record we enabled B2 on
-            // (Partner.AllowB2F — keyed by call as in RunAnswererAsync). To every other caller
+            // (Partner.AllowB2F — matched as in RunAnswererAsync). To every other caller
             // we send the B1-only SID, so we never accept FC from a partner we didn't offer B2
             // to (the answerer's B2 gate is consistent with this advertised SID). The greet must
             // precede the peek, hence the lookup here rather than inside the FBB runner.
-            Partner? partner = _store.GetPartner(child.RemoteCallsign);
+            // Match on the BASE callsign: the source SSID of an inbound connect is indeterminate
+            // (the caller grabs whatever SSID is free), so the partner is keyed by base call.
+            Partner? partner = _store.FindPartnerByBaseCall(child.RemoteCallsign);
             string sidLine = Sid.Build(_sidVersion, offerB2: partner?.AllowB2F ?? false);
             await child.SendAsync(Encoding.Latin1.GetBytes(sidLine + "\r\n"), cancellationToken).ConfigureAwait(false);
 

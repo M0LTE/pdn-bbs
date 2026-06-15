@@ -1252,7 +1252,9 @@ public sealed class BbsStore : IDisposable
 
     // ---------------------------------------------------------------- partners
 
-    /// <summary>Fetches a partner by its exact configured call (case-insensitive).</summary>
+    /// <summary>Fetches a partner by its exact configured call (case-insensitive). For looking up a
+    /// KNOWN partner by its configured key (the scheduler, routing). For matching the source of an
+    /// INBOUND connect, use <see cref="FindPartnerByBaseCall"/> — the source SSID is unreliable.</summary>
     public Partner? GetPartner(string call)
     {
         ArgumentNullException.ThrowIfNull(call);
@@ -1263,6 +1265,35 @@ public sealed class BbsStore : IDisposable
             cmd.Parameters.AddWithValue("$c", Callsigns.Normalize(call));
             using SqliteDataReader reader = cmd.ExecuteReader();
             return reader.Read() ? ReadPartner(reader) : null;
+        }
+    }
+
+    /// <summary>
+    /// Finds a forwarding partner by the BASE callsign of an inbound connect's source —
+    /// SSID-agnostic. An outbound AX.25 connect grabs whatever source SSID is free at the time
+    /// (in practice -15/-14/-13… next available, but it is indeterminate and not codified), so a
+    /// partner CANNOT be matched on the source SSID; the node behind the link is identified by its
+    /// base callsign. Returns the first partner whose configured call base-equals
+    /// <paramref name="call"/> (partners are distinct nodes, so there is at most one), else null.
+    /// </summary>
+    public Partner? FindPartnerByBaseCall(string call)
+    {
+        ArgumentNullException.ThrowIfNull(call);
+
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null, PartnerSelect + " ORDER BY call;");
+            using SqliteDataReader reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                Partner partner = ReadPartner(reader);
+                if (Callsigns.BaseEquals(partner.Call, call))
+                {
+                    return partner;
+                }
+            }
+
+            return null;
         }
     }
 

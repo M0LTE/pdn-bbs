@@ -73,7 +73,9 @@ public sealed class FbbSessionRunner
         ArgumentNullException.ThrowIfNull(child);
         ArgumentNullException.ThrowIfNull(initialData);
 
-        Partner? partner = _store.GetPartner(child.RemoteCallsign);
+        // Match the inbound caller on its BASE callsign — its source SSID is indeterminate
+        // (an outbound connect grabs whatever SSID is free), so it can't key the partner lookup.
+        Partner? partner = _store.FindPartnerByBaseCall(child.RemoteCallsign);
         string partnerCall = partner?.Call ?? Callsigns.Normalize(child.RemoteCallsign);
         IReadOnlyList<OutboundItem> outbound = partner is null
             ? []
