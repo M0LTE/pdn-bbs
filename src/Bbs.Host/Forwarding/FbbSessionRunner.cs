@@ -79,7 +79,11 @@ public sealed class FbbSessionRunner
         string partnerCall = partner?.Call ?? Callsigns.Normalize(child.RemoteCallsign);
         IReadOnlyList<OutboundItem> outbound = partner is null
             ? []
-            : OutboundBuilder.Build(_store.GetForwardQueue(partner.Call), partner, _identity, _time, _logger);
+            : OutboundBuilder.Build(_store.GetForwardQueue(partner.Call), partner, _identity, _time, _logger,
+                // Hold over-cap messages here too (same rule as the scheduler) so an in-session send
+                // doesn't re-skip them forever — see ForwardingScheduler / compat spec §4.1.
+                onOversize: (number, bytes) => _store.HoldMessage(number,
+                    FormattableString.Invariant($"too large for {partner.Call} ({bytes} > {partner.MaxTxSize} bytes)")));
         return RunAsync(FbbRole.Answerer, child, partner, partnerCall, outbound, initialData, cancellationToken);
     }
 

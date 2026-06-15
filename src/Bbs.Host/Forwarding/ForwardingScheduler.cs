@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using static System.FormattableString;
 using Bbs.Core;
 using Bbs.Host.Rhp;
 using Microsoft.Extensions.Logging;
@@ -229,7 +230,12 @@ public sealed class ForwardingScheduler
             LogScriptWarning(_logger, partner.Call, warning, null);
         }
 
-        IReadOnlyList<OutboundItem> outbound = OutboundBuilder.Build(queue, partner, _identity, _time, _logger);
+        // Hold an over-cap message rather than re-skipping it every cycle (compat spec §4.1 "bigger
+        // local → held"): it leaves the forward queue (GetForwardQueue excludes H) and the recorded
+        // reason lets the Sent view explain it instead of showing a perpetually-"queued" message.
+        IReadOnlyList<OutboundItem> outbound = OutboundBuilder.Build(queue, partner, _identity, _time, _logger,
+            onOversize: (number, bytes) => _store.HoldMessage(number,
+                Invariant($"too large for {partner.Call} ({bytes} > {partner.MaxTxSize} bytes)")));
         if (outbound.Count == 0 && !partner.Collect)
         {
             // Nothing to send and not a collect partner: don't dial for nothing. A non-empty

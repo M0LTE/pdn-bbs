@@ -107,6 +107,23 @@ public sealed class OutboundBuilderTests : IDisposable
     }
 
     [Fact]
+    public void OversizeMessage_ReportsToOnOversizeCallback_WithComposedSize()
+    {
+        Message big = Add(new string('x', 500) + "\r");
+        Message small = Add("ok\r");
+        var skipped = new List<(long Number, long Bytes)>();
+
+        IReadOnlyList<OutboundItem> items = OutboundBuilder.Build(
+            [big, small], Bpq(maxTx: 200), Identity, _time, NullLogger.Instance,
+            onOversize: (n, b) => skipped.Add((n, b)));
+
+        Assert.Equal(small.Number, Assert.Single(items).Number);   // small still built
+        (long number, long bytes) = Assert.Single(skipped);        // big reported once
+        Assert.Equal(big.Number, number);
+        Assert.True(bytes > 200, $"composed size {bytes} should exceed the 200-byte cap");
+    }
+
+    [Fact]
     public void EmptyHRoute_FallsBackToWw()
     {
         var identity = new BbsIdentity { Callsign = "GB7PDN", HRoute = "", SoftwareVersion = "PDN0.1.0" };

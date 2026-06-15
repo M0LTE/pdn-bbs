@@ -176,6 +176,30 @@ public sealed class StatusTransitionTests : IDisposable
     }
 
     [Fact]
+    public void HoldMessage_RecordsReason_AndCountHeldForwardsTracksIt()
+    {
+        Message p = _ts.Store.AddMessage(Drafts.Personal(to: "M0LTE", at: "GB7RDG"));
+        _ts.Store.EnqueueForwards(p.Number, ["GB7RDG"]);
+
+        // Before holding: a normal pending leg, no held count, no reason.
+        Assert.Equal(0, _ts.Store.CountHeldForwards("GB7RDG"));
+        Assert.Null(_ts.Store.GetMessage(p.Number)!.HoldReason);
+
+        _ts.Store.HoldMessage(p.Number, "too large for GB7RDG (209595 > 99999 bytes)");
+
+        Message held = _ts.Store.GetMessage(p.Number)!;
+        Assert.Equal(MessageStatus.Held, held.Status);
+        Assert.Equal("too large for GB7RDG (209595 > 99999 bytes)", held.HoldReason);
+        Assert.Empty(_ts.Store.GetForwardQueue("GB7RDG"));        // held → out of the live queue
+        Assert.Equal(1, _ts.Store.CountHeldForwards("GB7RDG"));   // ...but surfaced as held
+
+        // Unhold clears the held count (the reason field is incidental once it's forwarding again).
+        _ts.Store.Unhold(p.Number);
+        Assert.Equal(0, _ts.Store.CountHeldForwards("GB7RDG"));
+        Assert.Equal([p.Number], _ts.Store.GetForwardQueue("GB7RDG").Select(m => m.Number));
+    }
+
+    [Fact]
     public void MarkDelivered_OnlyForTraffic()
     {
         // §1.3 D n: T → status D; non-T → "not an NTS Message".

@@ -89,6 +89,15 @@ public sealed record Message
     public bool LocalOnly { get; init; }
 
     /// <summary>
+    /// Why this message is held, when it is (status <see cref="MessageStatus.Held"/>); null otherwise
+    /// or for a hold with no recorded reason. The forwarding scheduler sets it when it holds an
+    /// oversize message (compat spec §4.1 "bigger local → held") — e.g. "too large for GB7RDG
+    /// (209595 > 99999 bytes)" — so the Sent view can explain a held message instead of leaving it
+    /// looking perpetually queued. (schema v8)
+    /// </summary>
+    public string? HoldReason { get; init; }
+
+    /// <summary>
     /// All recipients (To and Cc). A multi-recipient message (S-line recipients separated by ';',
     /// compat spec §1.5, or a B2 message's repeated <c>To:</c>/<c>Cc:</c> lines, spec §3.9) is
     /// stored once with one row per recipient so it lists per-user; <see cref="MessageRecipient.Cc"/>

@@ -37,16 +37,19 @@ public sealed record BbsIdentity
 public static class OutboundBuilder
 {
     /// <summary>
-    /// Renders the queue for one partner, skipping (with a warning) anything over the
-    /// partner's MaxTxSize. v1 deviation, named: LinBPQ holds oversize local messages
-    /// (compat spec §4.1 "bigger local → held"); we leave them queued and skip them.
+    /// Renders the queue for one partner, skipping (with a warning) anything over the partner's
+    /// MaxTxSize. An over-cap message is reported via <paramref name="onOversize"/> (message number,
+    /// composed byte size) so the caller can hold it — LinBPQ holds oversize local messages (compat
+    /// spec §4.1 "bigger local → held") rather than retrying them forever. When the callback is null
+    /// (most tests) the message is simply skipped, the historical behaviour.
     /// </summary>
     public static IReadOnlyList<OutboundItem> Build(
         IReadOnlyList<Message> queue,
         Partner partner,
         BbsIdentity identity,
         TimeProvider time,
-        ILogger logger)
+        ILogger logger,
+        Action<long, long>? onOversize = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(partner);
@@ -61,6 +64,7 @@ public static class OutboundBuilder
             if (payload.Length > partner.MaxTxSize)
             {
                 LogOversize(logger, message.Number, payload.Length, partner.Call, partner.MaxTxSize, null);
+                onOversize?.Invoke(message.Number, payload.Length);
                 continue;
             }
 

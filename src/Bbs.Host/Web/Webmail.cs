@@ -444,6 +444,10 @@ public static class Webmail
         {
             Type = MessageType.Personal,
             FromCall = call,
+            // Show held mail to the sysop so an auto-held oversize message (held to stop it retrying
+            // forever) stays visible here with its reason, rather than vanishing. Non-sysops can't
+            // read held messages anyway (the held-invisible rule), so they don't list here.
+            IncludeHeld = IsSysop(o, call),
         }));
         string rows = SentRows(o, sent, page, o.PageSize, prefix, embed);
         return Html(Page(o, prefix, call, "Sent", embed,
@@ -1020,9 +1024,13 @@ public static class Webmail
             : """<span class="badge off">auto-dial off</span>""";
 
         int queued = o.Store.GetForwardQueue(p.Call).Count;
-        string queue = queued == 0
+        int held = o.Store.CountHeldForwards(p.Call);
+        // Held messages (e.g. oversize auto-holds) aren't in the queue, so surface them beside it —
+        // otherwise an all-held partner reads "empty" when it actually has stuck mail to attend to.
+        string heldNote = held == 0 ? "" : Inv($""" · <span class="badge off">{held} held</span>""");
+        string queue = (queued == 0
             ? """<span class="dim">empty</span>"""
-            : Inv($"<b>{queued}</b> message{(queued == 1 ? "" : "s")} waiting");
+            : Inv($"<b>{queued}</b> message{(queued == 1 ? "" : "s")} waiting")) + heldNote;
 
         string connect = p.ConnectScript.Count == 0
             ? """<span class="dim">none</span>"""
@@ -1563,7 +1571,7 @@ public static class Webmail
             string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}?from=sent"), embed)}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
             sb.Append(Inv($"<tr><td>{m.Number}</td><td>{to}</td>"))
               .Append(Inv($"<td class=\"nowrap\">{H(m.CreatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))}</td>"))
-              .Append(Inv($"<td>{subject}</td><td>{ForwardStatusBadge(o.Store.GetMessageForwards(m.Number))}</td></tr>"));
+              .Append(Inv($"<td>{subject}</td><td>{ForwardStatusBadge(m, o.Store.GetMessageForwards(m.Number))}</td></tr>"));
         }
 
         sb.Append("</table><p class=\"pager\">");
@@ -1582,12 +1590,20 @@ public static class Webmail
     }
 
     /// <summary>
-    /// The Sent view's forwarding-status cell from a message's forward targets: no targets = homed
-    /// here (delivered/held locally); any leg still pending = queued to those partners; otherwise
+    /// The Sent view's forwarding-status cell. A held message shows its hold reason (an oversize
+    /// auto-hold records "too large for &lt;partner&gt;") so it doesn't look stuck. Otherwise from the
+    /// forward targets: no targets = homed here; any leg still pending = queued to those partners;
     /// every leg sent = forwarded.
     /// </summary>
-    private static string ForwardStatusBadge(IReadOnlyList<MessageForward> forwards)
+    private static string ForwardStatusBadge(Message message, IReadOnlyList<MessageForward> forwards)
     {
+        if (message.Status == MessageStatus.Held)
+        {
+            return message.HoldReason is { Length: > 0 } reason
+                ? Inv($"""<span class="badge off">held &mdash; {H(reason)}</span>""")
+                : """<span class="badge off">held</span>""";
+        }
+
         if (forwards.Count == 0)
         {
             return """<span class="dim">delivered here</span>""";

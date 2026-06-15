@@ -344,6 +344,40 @@ public sealed class WebmailTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Sent_ShowsHoldReason_ForOversizeAutoHeldMessage_AndForwardingCardCountsIt()
+    {
+        // The sysop is the viewer (the harness sysop call is G0SYS) so held mail is visible in Sent.
+        ClaimCallsign("tom", "G0SYS");
+        _store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
+
+        Message m = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "G0SYS",
+            Recipients = ["M0LTE"],
+            At = "GB7RDG",
+            Subject = "big photo",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.EnqueueForwards(m.Number, ["GB7RDG"]);
+        // What the scheduler does when the message exceeds the partner's MaxTxSize.
+        _store.HoldMessage(m.Number, "too large for GB7RDG (209595 > 99999 bytes)");
+
+        using HttpClient client = await StartAsync();
+
+        // Sent explains the held message instead of showing a misleading "queued".
+        string sent = await client.GetStringAsync(new Uri("/sent", UriKind.Relative));
+        Assert.Contains("big photo", sent, StringComparison.Ordinal);
+        // The '>' in the reason is HTML-escaped in the rendered page.
+        Assert.Contains("too large for GB7RDG (209595 &gt; 99999 bytes)", sent, StringComparison.Ordinal);
+        Assert.DoesNotContain("queued &rarr; GB7RDG", sent, StringComparison.Ordinal);
+
+        // The forwarding card surfaces it as held (not a mute "empty" queue).
+        string fwd = await client.GetStringAsync(new Uri("/forwarding", UriKind.Relative));
+        Assert.Contains("1 held", fwd, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Sent_MessageView_BackLinkReturnsToSent_NotInbox()
     {
         ClaimCallsign("tom", "M0LTE");

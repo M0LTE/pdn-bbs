@@ -17,7 +17,7 @@ namespace Bbs.Core;
 public sealed class BbsStore : IDisposable
 {
     /// <summary>The schema version this build writes and expects.</summary>
-    public const int CurrentSchemaVersion = 7;
+    public const int CurrentSchemaVersion = 8;
 
     private readonly SqliteConnection _connection;
     private readonly TimeProvider _time;
@@ -267,7 +267,7 @@ public sealed class BbsStore : IDisposable
         ArgumentNullException.ThrowIfNull(query);
 
         var sql = new System.Text.StringBuilder(
-            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only FROM messages m");
+            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason FROM messages m");
         var parameters = new List<(string Name, object Value)>();
 
         if (query.ToCall is not null)
@@ -433,13 +433,14 @@ public sealed class BbsStore : IDisposable
     }
 
     /// <summary>Holds a live message (status → H). Returns false when missing, killed or already held.</summary>
-    public bool HoldMessage(long number)
+    public bool HoldMessage(long number, string? reason = null)
     {
         lock (_gate)
         {
             using SqliteCommand cmd = Command(null,
-                "UPDATE messages SET status='H' WHERE number=$n AND status NOT IN ('K','H');");
+                "UPDATE messages SET status='H', hold_reason=$r WHERE number=$n AND status NOT IN ('K','H');");
             cmd.Parameters.AddWithValue("$n", number);
+            cmd.Parameters.AddWithValue("$r", (object?)reason ?? DBNull.Value);
             return cmd.ExecuteNonQuery() > 0;
         }
     }
@@ -535,7 +536,7 @@ public sealed class BbsStore : IDisposable
         lock (_gate)
         {
             using SqliteCommand cmd = Command(null,
-                "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only " +
+                "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason " +
                 "FROM forwards f JOIN messages m ON m.number=f.message_number " +
                 "WHERE f.partner_call=$p AND f.forwarded_utc IS NULL AND m.status NOT IN ('K','H') " +
                 "ORDER BY CASE m.type WHEN 'T' THEN 0 WHEN 'P' THEN 1 ELSE 2 END, m.number;");
@@ -551,6 +552,25 @@ public sealed class BbsStore : IDisposable
             }
 
             return AttachRecipients(messages);
+        }
+    }
+
+    /// <summary>
+    /// How many messages bound for a partner are held (status H) with an unsent leg — i.e. pulled
+    /// out of its forward queue (an oversize auto-hold, compat spec §4.1) rather than waiting. The
+    /// forwarding card shows this beside the live queue depth so a held message isn't invisible.
+    /// </summary>
+    public int CountHeldForwards(string partnerCall)
+    {
+        ArgumentNullException.ThrowIfNull(partnerCall);
+
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "SELECT COUNT(*) FROM forwards f JOIN messages m ON m.number=f.message_number " +
+                "WHERE f.partner_call=$p AND f.forwarded_utc IS NULL AND m.status='H';");
+            cmd.Parameters.AddWithValue("$p", Callsigns.Normalize(partnerCall));
+            return (int)(long)cmd.ExecuteScalar()!;
         }
     }
 
@@ -1682,6 +1702,34 @@ public sealed class BbsStore : IDisposable
             version = 7;
         }
 
+        // v8 — a human-readable hold reason. PURELY ADDITIVE: the messages table gains a nullable
+        // `hold_reason` TEXT column (null for every existing row). The forwarding scheduler now holds
+        // an oversize message (compat spec §4.1 "bigger local → held") instead of re-skipping it
+        // every cycle, and records why here so the Sent view can show "too large for <partner>"
+        // rather than a mute, perpetually-"queued" message. No existing column/row is touched.
+        if (version < 8)
+        {
+            using SqliteTransaction tx = connection.BeginTransaction();
+
+            if (!ColumnExists(connection, tx, "messages", "hold_reason"))
+            {
+                using var ddl = connection.CreateCommand();
+                ddl.Transaction = tx;
+                ddl.CommandText = SchemaV8;
+                ddl.ExecuteNonQuery();
+            }
+
+            using (var stamp = connection.CreateCommand())
+            {
+                stamp.Transaction = tx;
+                stamp.CommandText = "UPDATE meta SET value='8' WHERE key='schema_version';";
+                stamp.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            version = 8;
+        }
+
         return version;
     }
 
@@ -1844,6 +1892,12 @@ public sealed class BbsStore : IDisposable
         ALTER TABLE partners ADD COLUMN con_timeout_seconds INTEGER NOT NULL DEFAULT 60;
         """;
 
+    // v8 — additive only (see Migrate): a nullable hold reason on messages, so an auto-held oversize
+    // message can explain itself in the UI ("too large for <partner>") instead of looking stuck.
+    private const string SchemaV8 = """
+        ALTER TABLE messages ADD COLUMN hold_reason TEXT;
+        """;
+
     private void InsertRecipient(SqliteTransaction tx, long number, string toCall, bool cc)
     {
         using SqliteCommand cmd = Command(tx,
@@ -1865,7 +1919,7 @@ public sealed class BbsStore : IDisposable
     private Message? GetMessageCore(long number)
     {
         using SqliteCommand cmd = Command(null,
-            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only " +
+            "SELECT m.number,m.type,m.status,m.from_call,m.at_bbs,m.bid,m.subject,m.body,m.received_from,m.created_utc,m.killed_utc,m.local_only,m.hold_reason " +
             "FROM messages m WHERE m.number=$n;");
         cmd.Parameters.AddWithValue("$n", number);
 
@@ -1938,6 +1992,7 @@ public sealed class BbsStore : IDisposable
             CreatedAt = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(9)),
             KilledAt = reader.IsDBNull(10) ? null : DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(10)),
             LocalOnly = reader.GetInt64(11) != 0,
+            HoldReason = reader.IsDBNull(12) ? null : reader.GetString(12),
         };
     }
 
