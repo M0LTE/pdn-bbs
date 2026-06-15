@@ -23,18 +23,26 @@ public sealed class ForwardingStatus
         _time = time;
     }
 
-    /// <summary>Records a clean dial — clears the failure streak and any error.</summary>
+    /// <summary>Records a cycle that reached the partner and ran — clears the failure streak.</summary>
     public void RecordSuccess(string call)
     {
         ArgumentNullException.ThrowIfNull(call);
         _byCall[Callsigns.Normalize(call)] = new PartnerForwardingState(_time.GetUtcNow(), Ok: true, Error: null, ConsecutiveFailures: 0);
     }
 
-    /// <summary>Records a failed dial with its reason and the running failure count (drives backoff).</summary>
-    public void RecordFailure(string call, string error, int consecutiveFailures)
+    /// <summary>
+    /// Records a failed dial with its reason, incrementing this partner's consecutive-failure streak
+    /// (atomically — the scheduler loop and a UI read can race). The first failure after a success is 1.
+    /// </summary>
+    public void RecordFailure(string call, string error)
     {
         ArgumentNullException.ThrowIfNull(call);
-        _byCall[Callsigns.Normalize(call)] = new PartnerForwardingState(_time.GetUtcNow(), Ok: false, error, consecutiveFailures);
+        DateTimeOffset now = _time.GetUtcNow();
+        _byCall.AddOrUpdate(
+            Callsigns.Normalize(call),
+            _ => new PartnerForwardingState(now, Ok: false, error, ConsecutiveFailures: 1),
+            (_, prev) => new PartnerForwardingState(now, Ok: false, error,
+                ConsecutiveFailures: (prev.Ok ? 0 : prev.ConsecutiveFailures) + 1));
     }
 
     /// <summary>The last recorded outcome for a partner, or null if it has not been dialled yet.</summary>

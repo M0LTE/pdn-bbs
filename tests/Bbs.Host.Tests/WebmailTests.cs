@@ -51,7 +51,7 @@ public sealed class WebmailTests : IAsyncDisposable
 
     private async Task<HttpClient> StartAsync(
         string pdnUser = "tom", bool gatewayHeader = true, string? forwardedPrefix = null, bool autoRedirect = true,
-        int? maxUploadBytes = null)
+        int? maxUploadBytes = null, ForwardingStatus? forwarding = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -68,6 +68,7 @@ public sealed class WebmailTests : IAsyncDisposable
             SysopCallsign = "G0SYS", // distinct from the test users — sysop may read/kill anything
             OnPartnersChanged = () => Interlocked.Increment(ref _partnersChanged),
             OnForwardNow = call => { lock (_forwardNow) { _forwardNow.Add(call); } },
+            Forwarding = forwarding,
         };
         if (maxUploadBytes is { } cap)
         {
@@ -376,6 +377,42 @@ public sealed class WebmailTests : IAsyncDisposable
         // The held message is flagged for attention, and is NOT shown as an inbox row here.
         Assert.Contains("held", home, StringComparison.Ordinal);
         Assert.DoesNotContain(">big<", home, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StatusDashboard_SurfacesAFailingPartner_WithReasonAndAttention()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        _store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
+
+        var forwarding = new ForwardingStatus(_time);
+        forwarding.RecordFailure("GB7RDG", "connect refused");
+        forwarding.RecordFailure("GB7RDG", "connect refused"); // streak → 2
+
+        using HttpClient client = await StartAsync(forwarding: forwarding);
+        string home = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+
+        Assert.Contains("failing (2): connect refused", home, StringComparison.Ordinal);                 // Health column
+        Assert.Contains("Forwarding to GB7RDG is failing (2 attempts): connect refused", home, StringComparison.Ordinal); // attention callout
+    }
+
+    [Fact]
+    public async Task StatusDashboard_ShowsAHealthyPartnerAsOk_AfterASuccessfulCycle()
+    {
+        // A delivered cycle that closed roughly (the message-40 case) records success — it must read
+        // "ok", not "failing".
+        ClaimCallsign("tom", "M0LTE");
+        _store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
+
+        var forwarding = new ForwardingStatus(_time);
+        forwarding.RecordFailure("GB7RDG", "connect refused"); // was failing...
+        forwarding.RecordSuccess("GB7RDG");                    // ...then a cycle ran
+
+        using HttpClient client = await StartAsync(forwarding: forwarding);
+        string home = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+
+        Assert.Contains("badge on\">ok", home, StringComparison.Ordinal);
+        Assert.DoesNotContain("is failing", home, StringComparison.Ordinal);
     }
 
     [Fact]

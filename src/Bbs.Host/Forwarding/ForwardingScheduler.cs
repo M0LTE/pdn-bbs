@@ -211,16 +211,18 @@ public sealed class ForwardingScheduler
                 // nothing of ours to send, the session's in-session reverse (spec §3.11) drains
                 // the partner's queue for us. "Nothing to send AND nothing collected" is a clean
                 // graceful no-op (FF↔FQ) — not a failure, so it does not arm the backoff.
-                bool graceful = await RunCycleAsync(partner, queue, cancellationToken).ConfigureAwait(false);
-                if (graceful)
+                CycleOutcome outcome = await RunCycleAsync(partner, queue, cancellationToken).ConfigureAwait(false);
+                // Backoff is unchanged: a non-graceful close still arms it (it self-clears once the
+                // queue drains). Health, though, tracks whether we could forward at all — a session
+                // that ran is healthy even if it closed roughly, so it does NOT read as "failing".
+                failures = outcome.Graceful ? 0 : failures + 1;
+                if (outcome.Ran)
                 {
-                    failures = 0;
                     _status.RecordSuccess(partner.Call);
                 }
                 else
                 {
-                    failures++;
-                    _status.RecordFailure(partner.Call, "the forwarding cycle did not complete cleanly", failures);
+                    _status.RecordFailure(partner.Call, outcome.Error ?? "could not forward to the partner");
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -230,13 +232,22 @@ public sealed class ForwardingScheduler
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failures++;
-                _status.RecordFailure(partner.Call, ex.Message, failures);
+                _status.RecordFailure(partner.Call, ex.Message);
                 LogCycleFailed(_logger, partner.Call, ex.Message, failures, null);
             }
         }
     }
 
-    private async Task<bool> RunCycleAsync(Partner partner, IReadOnlyList<Message> queue, CancellationToken cancellationToken)
+    /// <summary>
+    /// The outcome of one dial attempt, for both backoff and the dashboard health. <see cref="Ran"/>
+    /// is true when we reached the partner and ran a session (or had nothing to send) — i.e. the link
+    /// works, even if the session closed roughly or the peer dropped after accepting; false only when
+    /// we could not connect/navigate (the connect script failed). <see cref="Graceful"/> is the clean
+    /// FF/FQ close (drives backoff, unchanged). <see cref="Error"/> is the reason when not Ran.
+    /// </summary>
+    private sealed record CycleOutcome(bool Ran, bool Graceful, string? Error);
+
+    private async Task<CycleOutcome> RunCycleAsync(Partner partner, IReadOnlyList<Message> queue, CancellationToken cancellationToken)
     {
         ConnectPlan plan = ConnectScript.Resolve(partner);
         foreach (string warning in plan.Warnings)
@@ -254,7 +265,7 @@ public sealed class ForwardingScheduler
         {
             // Nothing to send and not a collect partner: don't dial for nothing. A non-empty
             // queue that built to zero outbound is everything-skipped (oversize) — same verdict.
-            return true;
+            return new CycleOutcome(Ran: true, Graceful: true, Error: null);
         }
 
         if (outbound.Count == 0)
@@ -284,13 +295,16 @@ public sealed class ForwardingScheduler
             catch (ConnectScriptException ex)
             {
                 LogScriptFailed(_logger, partner.Call, ex.Message, null);
-                return false;
+                return new CycleOutcome(Ran: false, Graceful: false, Error: ex.Message);
             }
 
             FbbSessionResult result = await _runner
                 .RunCallerAsync(child, partner, outbound, cancellationToken, initial)
                 .ConfigureAwait(false);
-            return result.Graceful;
+            // The session ran — the link works — so this is healthy for the dashboard even if the
+            // peer dropped after accepting (Completed/Graceful false). Delivery itself is recorded
+            // per-message via the forward queue; Graceful still drives backoff as before.
+            return new CycleOutcome(Ran: true, Graceful: result.Graceful, Error: null);
         }
         finally
         {
