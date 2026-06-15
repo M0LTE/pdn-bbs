@@ -453,6 +453,7 @@ public static class Webmail
             {RenderMessageBody(message)}
             {attachments}
             {killForm}
+            <p class="back"><a href="{U(prefix, backPath, embed)}">&laquo; Back to {backLabel}</a></p>
             """, theme));
     }
 
@@ -1035,7 +1036,9 @@ public static class Webmail
         }
 
         string content = string.Join("\n", lines.Skip(i));
-        return Inv($"<pre>{H(content)}</pre>") + RenderTrace(trace);
+        // Trace (the friendly "Relayed:" path + the raw-headers expando) ABOVE the body, grouped
+        // with the message's other headers — the body reads cleanly beneath them.
+        return RenderTrace(trace) + Inv($"<pre>{H(content)}</pre>");
     }
 
     /// <summary>

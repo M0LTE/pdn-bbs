@@ -1428,6 +1428,24 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.Contains("Relayed:", page, StringComparison.Ordinal);               // friendly path summary
         Assert.Contains("VK2RZ → GB7RDG", page, StringComparison.Ordinal);    // origin → here order
         Assert.Contains("Routing headers (2)", page, StringComparison.Ordinal);    // collapsible raw block
+        // The trace sits ABOVE the body.
+        Assert.True(page.IndexOf("Relayed:", StringComparison.Ordinal)
+            < page.IndexOf("Actual message text.", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ReadMessage_HasBackLinks_AtTopAndBottom()
+    {
+        ClaimCallsign("tom", "M0LTE");
+        Message stored = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Bulletin, From = "G8ABC", Recipients = ["PACKET"], Subject = "two backs", Body = Encoding.Latin1.GetBytes("hi\r"),
+        });
+        using HttpClient client = await StartAsync();
+
+        string page = await client.GetStringAsync(new Uri($"/messages/{stored.Number}", UriKind.Relative));
+        // One back link above the message, one below.
+        Assert.Equal(2, page.Split("Back to Bulletins").Length - 1);
     }
 
     [Fact]
