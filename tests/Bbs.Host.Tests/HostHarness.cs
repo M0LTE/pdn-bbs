@@ -104,6 +104,9 @@ internal sealed class HostHarness : IAsyncDisposable
 
     public ForwardingScheduler? Scheduler { get; private set; }
 
+    /// <summary>The scheduler's live per-partner forwarding-health registry (set by StartScheduler).</summary>
+    public ForwardingStatus ForwardingStatus { get; private set; } = null!;
+
     public CancellationToken Token => _cts.Token;
 
     /// <summary>
@@ -131,7 +134,8 @@ internal sealed class HostHarness : IAsyncDisposable
     /// </summary>
     public void StartScheduler()
     {
-        Scheduler = new ForwardingScheduler(Link, Runner, Store, Identity, Time, NullLogger<ForwardingScheduler>.Instance);
+        ForwardingStatus = new ForwardingStatus(Time);
+        Scheduler = new ForwardingScheduler(Link, Runner, Store, Identity, Time, ForwardingStatus, NullLogger<ForwardingScheduler>.Instance);
         Routing.NudgePartner = Scheduler.Nudge;
         _loops.Add(Scheduler.RunAsync(_cts.Token));
     }

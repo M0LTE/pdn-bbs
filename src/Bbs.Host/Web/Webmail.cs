@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using Bbs.Console;
 using Bbs.Core;
+using Bbs.Host.Forwarding;
 using Bbs.SevenPlus;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -53,6 +54,13 @@ public sealed record WebmailOptions
 
     /// <summary>The sysop callsign (sysop visibility in webmail), or empty.</summary>
     public string SysopCallsign { get; init; } = "";
+
+    /// <summary>
+    /// Live per-partner forwarding outcomes (the scheduler's <see cref="Bbs.Host.Forwarding.ForwardingStatus"/>),
+    /// so the status dashboard can show a failing/flapping link with its reason rather than a mute
+    /// "waiting". Null in tests/standalone with no scheduler — the dashboard then omits the health column.
+    /// </summary>
+    public Bbs.Host.Forwarding.ForwardingStatus? Forwarding { get; init; }
 
     /// <summary>Rows per page on the inbox/bulletins lists.</summary>
     public int PageSize { get; init; } = 25;
@@ -443,13 +451,26 @@ public static class Webmail
 
         string banner = notice is null ? "" : Inv($"""<p class="saved">{H(notice)}</p>""");
 
-        // Attention callout when anything is held (e.g. oversize auto-holds) — it won't forward until
-        // dealt with, so surface it rather than leaving it buried.
-        string attention = held == 0
-            ? ""
-            : Inv($"""<p class="err">{held} message{(held == 1 ? " is" : "s are")} held — open from <a href="{U(prefix, "/sent", embed)}">Sent</a> to release or kill.</p>""");
-
         IReadOnlyList<Partner> partners = o.Store.ListPartners();
+
+        // Attention callouts — held mail (won't forward until dealt with) and any partner whose last
+        // dial FAILED (a flapping link must be loud, not a calm "waiting" — the GB7RDG send-too-big
+        // case that read as healthy). Each is surfaced at the top with its reason.
+        var alerts = new List<string>();
+        if (held > 0)
+        {
+            alerts.Add(Inv($"""{held} message{(held == 1 ? " is" : "s are")} held — open from <a href="{U(prefix, "/sent", embed)}">Sent</a> to release or kill."""));
+        }
+
+        foreach (Partner p in partners.OrderBy(p => p.Call, StringComparer.OrdinalIgnoreCase))
+        {
+            if (o.Forwarding?.Get(p.Call) is { Ok: false } st)
+            {
+                alerts.Add(Inv($"Forwarding to {H(p.Call)} is failing ({st.ConsecutiveFailures} attempt{(st.ConsecutiveFailures == 1 ? "" : "s")}): {H(st.Error ?? "unknown error")}"));
+            }
+        }
+
+        string attention = string.Concat(alerts.Select(a => $"""<p class="err">{a}</p>"""));
         string forwarding = partners.Count == 0
             ? """<p class="dim">No forwarding partners configured.</p>"""
             : BuildForwardingHealth(o, partners);
@@ -471,7 +492,7 @@ public static class Webmail
     private static string BuildForwardingHealth(WebmailOptions o, IReadOnlyList<Partner> partners)
     {
         var sb = new StringBuilder();
-        sb.Append("<table><tr><th>Partner</th><th>State</th><th>Waiting</th><th>Held</th><th>Last forwarded (UTC)</th></tr>");
+        sb.Append("<table><tr><th>Partner</th><th>State</th><th>Waiting</th><th>Held</th><th>Last forwarded (UTC)</th><th>Health</th></tr>");
         foreach (Partner p in partners.OrderBy(p => p.Call, StringComparer.OrdinalIgnoreCase))
         {
             int waiting = o.Store.GetForwardQueue(p.Call).Count;
@@ -482,7 +503,15 @@ public static class Webmail
                 : """<span class="badge off">auto-dial off</span>""";
             string heldCell = held == 0 ? "—" : Inv($"""<span class="badge off">{held}</span>""");
             string lastCell = last is { } l ? H(l.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)) : """<span class="dim">never</span>""";
-            sb.Append(Inv($"<tr><td>{H(p.Call)}</td><td>{state}</td><td>{waiting}</td><td>{heldCell}</td><td class=\"nowrap\">{lastCell}</td></tr>"));
+            // The live dial outcome: ok / failing(N): reason / not yet dialled. The whole point of (b) —
+            // a failing link reads red here, not as a contented "waiting".
+            PartnerForwardingState? st = o.Forwarding?.Get(p.Call);
+            string healthCell = st is null
+                ? """<span class="dim">—</span>"""
+                : st.Ok
+                    ? """<span class="badge on">ok</span>"""
+                    : Inv($"""<span class="badge off">failing ({st.ConsecutiveFailures}): {H(st.Error ?? "unknown error")}</span>""");
+            sb.Append(Inv($"<tr><td>{H(p.Call)}</td><td>{state}</td><td>{waiting}</td><td>{heldCell}</td><td class=\"nowrap\">{lastCell}</td><td>{healthCell}</td></tr>"));
         }
 
         sb.Append("</table>");

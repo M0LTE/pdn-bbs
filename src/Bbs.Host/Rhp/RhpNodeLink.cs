@@ -348,6 +348,9 @@ public sealed class RhpNodeLink : IAsyncDisposable
     internal async Task SendOnChildAsync(int handle, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         RhpClient client = _client ?? throw new InvalidOperationException("The RHP link is down.");
+        // Hand the whole body to the client — RhpV2.Client fragments a large send across as many RHP
+        // frames as the engine-link allows (it owns the frame size; the node reassembles the stream
+        // and the AX.25 link segments to N1/paclen I-frames regardless). We just send the buffer.
         SendReplyMessage reply = await client.SendOnHandleAsync(handle, data.Span, cancellationToken).ConfigureAwait(false);
         if (reply.ErrCode != 0)
         {

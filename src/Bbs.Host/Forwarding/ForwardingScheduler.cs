@@ -31,6 +31,7 @@ public sealed class ForwardingScheduler
     private readonly BbsStore _store;
     private readonly BbsIdentity _identity;
     private readonly TimeProvider _time;
+    private readonly ForwardingStatus _status;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<string, Channel<bool>> _nudges = new(StringComparer.OrdinalIgnoreCase);
 
@@ -52,6 +53,7 @@ public sealed class ForwardingScheduler
         BbsStore store,
         BbsIdentity identity,
         TimeProvider time,
+        ForwardingStatus status,
         ILogger<ForwardingScheduler> logger)
     {
         ArgumentNullException.ThrowIfNull(link);
@@ -59,12 +61,14 @@ public sealed class ForwardingScheduler
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(identity);
         ArgumentNullException.ThrowIfNull(time);
+        ArgumentNullException.ThrowIfNull(status);
         ArgumentNullException.ThrowIfNull(logger);
         _link = link;
         _runner = runner;
         _store = store;
         _identity = identity;
         _time = time;
+        _status = status;
         _logger = logger;
 
         foreach (Partner partner in store.ListPartners())
@@ -208,7 +212,16 @@ public sealed class ForwardingScheduler
                 // the partner's queue for us. "Nothing to send AND nothing collected" is a clean
                 // graceful no-op (FF↔FQ) — not a failure, so it does not arm the backoff.
                 bool graceful = await RunCycleAsync(partner, queue, cancellationToken).ConfigureAwait(false);
-                failures = graceful ? 0 : failures + 1;
+                if (graceful)
+                {
+                    failures = 0;
+                    _status.RecordSuccess(partner.Call);
+                }
+                else
+                {
+                    failures++;
+                    _status.RecordFailure(partner.Call, "the forwarding cycle did not complete cleanly", failures);
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -217,6 +230,7 @@ public sealed class ForwardingScheduler
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failures++;
+                _status.RecordFailure(partner.Call, ex.Message, failures);
                 LogCycleFailed(_logger, partner.Call, ex.Message, failures, null);
             }
         }

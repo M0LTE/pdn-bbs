@@ -127,8 +127,10 @@ public static class HostComposition
         builder.Services.AddSingleton(sp => new FbbSessionRunner(
             store, sp.GetRequiredService<InboundMessageReceiver>(), identity, version, time,
             sp.GetRequiredService<ILogger<FbbSessionRunner>>()));
+        builder.Services.AddSingleton(new ForwardingStatus(time));
         builder.Services.AddSingleton(sp => new ForwardingScheduler(
             sp.GetRequiredService<RhpNodeLink>(), sp.GetRequiredService<FbbSessionRunner>(), store, identity, time,
+            sp.GetRequiredService<ForwardingStatus>(),
             sp.GetRequiredService<ILogger<ForwardingScheduler>>()));
         builder.Services.AddSingleton<IUserSettingsStore>(
             new JsonUserSettingsStore(Path.Combine(stateDir, "user-settings.json")));
@@ -262,6 +264,8 @@ public static class HostComposition
             // and R-lines stay SSID-less and come from the store/engine own-call (baseCallsign) above.
             StationCallsign = bindCallsign,
             SysopCallsign = config.Sysop,
+            // Live forwarding health so the status dashboard surfaces a failing partner + reason.
+            Forwarding = app.Services.GetRequiredService<ForwardingStatus>(),
         });
 
         log.Starting(version, bindCallsign, config.Rhp.Host!, config.Rhp.Port!.Value, config.Web.Bind, config.Web.Port);
