@@ -117,4 +117,26 @@ public sealed class ListQueryTests : IDisposable
         // e.g. "LP> M0LTE"-shaped query: personals addressed to M0LTE, newest-first.
         Assert.Equal([5], Numbers(new MessageQuery { Type = MessageType.Personal, ToCall = "M0LTE" }));
     }
+
+    [Fact]
+    public void HomedLocally_ExcludesMessagesQueuedForForwarding()
+    {
+        // 6: a personal addressed to our local user M0LTE but @ a remote BBS — outbound, so it
+        //    gets a forward row (as RoutingService would enqueue). It IS addressed to M0LTE...
+        Message outbound = _ts.Store.AddMessage(
+            Drafts.Personal(from: "M0LTE", to: "M0LTE", at: "GB7RDG", subject: "to myself @ GB7RDG"));
+        _ts.Store.EnqueueForwards(outbound.Number, ["GB7RDG"]);
+
+        // ...so a plain LM-for-M0LTE lists it alongside the locally-homed #5 (newest-first).
+        Assert.Equal([outbound.Number, 5], Numbers(new MessageQuery { ToCall = "M0LTE" }));
+
+        // But the Inbox sense (HomedLocally) drops the outbound one — it's queued to a partner,
+        // not received here — and keeps the locally-homed #5.
+        Assert.Equal([5], Numbers(new MessageQuery { ToCall = "M0LTE", HomedLocally = true }));
+
+        // Durable across the actual send: once forwarded (forwarded_utc stamped, row kept) it stays
+        // excluded rather than re-surfacing in the inbox.
+        _ts.Store.MarkForwarded(outbound.Number, "GB7RDG");
+        Assert.Equal([5], Numbers(new MessageQuery { ToCall = "M0LTE", HomedLocally = true }));
+    }
 }

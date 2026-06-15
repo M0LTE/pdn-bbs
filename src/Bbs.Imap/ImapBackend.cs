@@ -190,6 +190,10 @@ public sealed class ImapBackend
                 Type = MessageType.Personal,
                 ToCall = callsign,
                 OldestFirst = true,
+                // INBOX is mail received/held here, not mail we're forwarding on — a personal to
+                // one of our users @ a remote BBS is outbound, so it's excluded (same rule as the
+                // webmail Inbox). See MessageQuery.HomedLocally.
+                HomedLocally = true,
             }),
             ImapFolderKind.BulletinCategory => _store.ListMessages(new MessageQuery
             {

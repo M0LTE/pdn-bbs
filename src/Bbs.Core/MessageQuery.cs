@@ -48,4 +48,17 @@ public sealed record MessageQuery
 
     /// <summary>Include K messages (sysop LK) — compat spec §2.2.</summary>
     public bool IncludeKilled { get; init; }
+
+    /// <summary>
+    /// Restrict to messages homed here — those with NO forward target (no row in
+    /// <c>forwards</c>), i.e. mail received/held locally rather than queued or already sent on to a
+    /// partner BBS. This is the "Inbox" sense of received mail: a personal addressed to one of our
+    /// users <i>at a remote BBS</i> (e.g. <c>M0LTE@GB7RDG</c>) is outbound — the router enqueues it
+    /// to that partner, so a <c>forwards</c> row exists and this flag hides it from the local inbox,
+    /// even though the addressee callsign happens to match a local user. (<c>forwards</c> rows are
+    /// durable — <see cref="BbsStore.MarkForwarded"/> stamps <c>forwarded_utc</c> but keeps the row
+    /// — so an already-forwarded message stays excluded rather than re-surfacing once sent. A
+    /// message-level signal: AT homes the whole message, so "has a forward row" ⟺ "homed remotely".)
+    /// </summary>
+    public bool HomedLocally { get; init; }
 }

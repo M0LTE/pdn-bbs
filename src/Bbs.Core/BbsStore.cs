@@ -331,6 +331,15 @@ public sealed class BbsStore : IDisposable
             parameters.Add(("$qat", query.AtPrefix.Trim().ToUpperInvariant()));
         }
 
+        if (query.HomedLocally)
+        {
+            // Mail received/held here, never routed to a partner: exclude anything with a forward
+            // target (queued OR already sent — the row is durable). The "Inbox" sense — see
+            // MessageQuery.HomedLocally. Outbound mail to one of our users @ a remote BBS has a
+            // forwards row, so this drops it from the local inbox.
+            sql.Append(" AND NOT EXISTS(SELECT 1 FROM forwards f WHERE f.message_number=m.number)");
+        }
+
         sql.Append(query.OldestFirst ? " ORDER BY m.number ASC" : " ORDER BY m.number DESC");
 
         if (query.Limit is { } limit)
@@ -542,6 +551,30 @@ public sealed class BbsStore : IDisposable
             }
 
             return AttachRecipients(messages);
+        }
+    }
+
+    /// <summary>
+    /// The forward targets recorded for a message — each partner it was routed to, with whether
+    /// that leg has been sent (<c>forwarded_utc</c> stamped). Empty when the message was homed
+    /// locally (never routed to a partner). Drives the Sent view's per-message status badge.
+    /// </summary>
+    public IReadOnlyList<MessageForward> GetMessageForwards(long number)
+    {
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "SELECT partner_call, forwarded_utc FROM forwards WHERE message_number=$n ORDER BY partner_call;");
+            cmd.Parameters.AddWithValue("$n", number);
+
+            var forwards = new List<MessageForward>();
+            using SqliteDataReader reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                forwards.Add(new MessageForward(reader.GetString(0), !reader.IsDBNull(1)));
+            }
+
+            return forwards;
         }
     }
 

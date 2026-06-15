@@ -146,6 +146,9 @@ public static class Webmail
         app.MapGet("/bulletins", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
             (prefix, call) => Bulletins(options, prefix, call, page ?? 1, Embed(ctx), Theme(ctx))));
 
+        app.MapGet("/sent", (HttpContext ctx, int? page) => WithCallsign(ctx, options,
+            (prefix, call) => Sent(options, prefix, call, page ?? 1, Embed(ctx), Theme(ctx))));
+
         app.MapGet("/messages/{number:long}", (HttpContext ctx, long number) => WithCallsign(ctx, options,
             (prefix, call) => ReadMessage(options, prefix, call, number, Embed(ctx), Theme(ctx))));
 
@@ -400,6 +403,11 @@ public static class Webmail
         {
             Type = MessageType.Personal,
             ToCall = call,
+            // The Inbox is mail received/held here, not mail we're forwarding on: a personal
+            // addressed to one of our own users @ a remote BBS (e.g. M0LTE@GB7RDG) is outbound —
+            // queued to that partner — so it must not show in the local inbox even though the
+            // addressee matches a local user. See MessageQuery.HomedLocally.
+            HomedLocally = true,
         }));
         // Personal placeholders are scoped to this user's incoming files only (never leak another
         // user's private incoming-file name into this inbox).
@@ -423,6 +431,24 @@ public static class Webmail
             $"""
             <h2>Bulletins</h2>
             {placeholders}
+            {rows}
+            """, theme));
+    }
+
+    private static IResult Sent(WebmailOptions o, string prefix, string call, int page, bool embed, string? theme)
+    {
+        // Personals this user composed — the counterpart to the Inbox now that outbound mail is no
+        // longer shown there. Each row carries its forwarding status (queued / forwarded / homed
+        // here), so this view doubles as the outbox without a second tab.
+        IReadOnlyList<Message> sent = HideSevenPlusParts(o.Store, o.Store.ListMessages(new MessageQuery
+        {
+            Type = MessageType.Personal,
+            FromCall = call,
+        }));
+        string rows = SentRows(o, sent, page, o.PageSize, prefix, embed);
+        return Html(Page(o, prefix, call, "Sent", embed,
+            $"""
+            <h2>Sent — personal messages from {H(call)}</h2>
             {rows}
             """, theme));
     }
@@ -940,7 +966,6 @@ public static class Webmail
         return Html(Page(o, prefix, call, "Forwarding", embed,
             $"""
             <h2>Forwarding partners <span class="dim">— {partners.Count} configured</span></h2>
-            <p class="dim">Add and edit forwarding partners as a form, or edit them all at once as YAML.</p>
             {tabs}
             {banner}
             {body}
@@ -1513,6 +1538,65 @@ public static class Webmail
     }
 
     /// <summary>
+    /// The Sent listing: like <see cref="MessageRows"/> but recipient-centric (To, not From) with a
+    /// per-message forwarding-status column instead of the read dot — the status is the whole point
+    /// of the view, surfacing the outbox state inline.
+    /// </summary>
+    private static string SentRows(WebmailOptions o, IReadOnlyList<Message> messages, int page, int pageSize, string prefix, bool embed)
+    {
+        page = Math.Max(1, page);
+        var slice = messages.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+        if (slice.Count == 0 && page == 1)
+        {
+            return "<p>Nothing sent yet.</p>";
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("<table><tr><th>#</th><th>To</th><th>Date (UTC)</th><th>Subject</th><th>Status</th></tr>");
+        foreach (Message m in slice)
+        {
+            string to = H(string.Join(";", m.Recipients.Where(r => !r.Cc).Select(r => r.ToCall)))
+                + (m.At is null ? "" : "@" + H(m.At));
+            string subject = Inv($"""<a href="{U(prefix, Inv($"/messages/{m.Number}"), embed)}">{H(m.Subject.Length == 0 ? "(no subject)" : m.Subject)}</a>""");
+            sb.Append(Inv($"<tr><td>{m.Number}</td><td>{to}</td>"))
+              .Append(Inv($"<td class=\"nowrap\">{H(m.CreatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))}</td>"))
+              .Append(Inv($"<td>{subject}</td><td>{ForwardStatusBadge(o.Store.GetMessageForwards(m.Number))}</td></tr>"));
+        }
+
+        sb.Append("</table><p class=\"pager\">");
+        if (page > 1)
+        {
+            sb.Append(Inv($"""<a href="{U(prefix, Inv($"/sent?page={page - 1}"), embed)}">&laquo; newer</a> """));
+        }
+
+        if (messages.Count > page * pageSize)
+        {
+            sb.Append(Inv($"""<a href="{U(prefix, Inv($"/sent?page={page + 1}"), embed)}">older &raquo;</a>"""));
+        }
+
+        sb.Append("</p>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The Sent view's forwarding-status cell from a message's forward targets: no targets = homed
+    /// here (delivered/held locally); any leg still pending = queued to those partners; otherwise
+    /// every leg sent = forwarded.
+    /// </summary>
+    private static string ForwardStatusBadge(IReadOnlyList<MessageForward> forwards)
+    {
+        if (forwards.Count == 0)
+        {
+            return """<span class="dim">delivered here</span>""";
+        }
+
+        string[] pending = [.. forwards.Where(f => !f.Forwarded).Select(f => f.PartnerCall)];
+        return pending.Length > 0
+            ? Inv($"""<span class="badge off">queued &rarr; {H(string.Join(", ", pending))}</span>""")
+            : """<span class="badge on">forwarded &#10003;</span>""";
+    }
+
+    /// <summary>
     /// The page chrome. In slot/embed mode (pdn renders us in a borderless iframe with
     /// <c>pdn_embed=1</c>) we OMIT the big <c>&lt;h1&gt;</c> station-identity bar — the panel already
     /// shows the app's name, so emitting our own would double the chrome — and trim the top margin so
@@ -1538,7 +1622,7 @@ public static class Webmail
             <!doctype html>
             <html{{HtmlThemeClass(theme)}}><head><meta charset="utf-8"><title>{{H(o.StationCallsign)}} — {{H(title)}}</title>{{Style}}</head>
             <body><main{{mainClass}}>
-            {{header}}<nav><a href="{{U(prefix, "/", embed)}}">Inbox</a> · <a href="{{U(prefix, "/bulletins", embed)}}">Bulletins</a> · <a href="{{U(prefix, "/compose", embed)}}">Compose</a> · <a href="{{U(prefix, "/settings", embed)}}">Settings</a>{{forwardingTab}}
+            {{header}}<nav><a href="{{U(prefix, "/", embed)}}">Inbox</a> · <a href="{{U(prefix, "/sent", embed)}}">Sent</a> · <a href="{{U(prefix, "/bulletins", embed)}}">Bulletins</a> · <a href="{{U(prefix, "/compose", embed)}}">Compose</a> · <a href="{{U(prefix, "/settings", embed)}}">Settings</a>{{forwardingTab}}
             <span class="dim">signed in as {{H(call)}}</span></nav>
             {{body}}
             </main></body></html>

@@ -245,6 +245,104 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.Equal(MessageStatus.Read, _store.GetMessage(stored.Number)!.Status);
     }
 
+    [Fact]
+    public async Task Inbox_ExcludesOutboundMailToSelfAtARemoteBbs_ButShowsReceivedMail()
+    {
+        // The reported bug: composing to M0LTE@GB7RDG (our own user, but @ a remote partner) made
+        // the outbound message appear in M0LTE's local Inbox — it's queued for forwarding to GB7RDG,
+        // not received here. The Inbox must show received/locally-homed mail only.
+        ClaimCallsign("tom", "M0LTE");
+
+        Message outbound = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["M0LTE"],
+            At = "GB7RDG",
+            Subject = "OUTBOUND-to-self-at-GB7RDG",
+            Body = Encoding.Latin1.GetBytes("forward me on.\r"),
+        });
+        _store.EnqueueForwards(outbound.Number, ["GB7RDG"]); // the routed/outbound state
+
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "G8ABC",
+            Recipients = ["M0LTE"],
+            Subject = "RECEIVED-for-me",
+            Body = Encoding.Latin1.GetBytes("hello.\r"),
+        });
+
+        using HttpClient client = await StartAsync();
+        string inbox = await client.GetStringAsync(new Uri("/", UriKind.Relative));
+
+        Assert.Contains("RECEIVED-for-me", inbox, StringComparison.Ordinal);
+        Assert.DoesNotContain("OUTBOUND-to-self-at-GB7RDG", inbox, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Sent_ListsMyComposedMail_WithForwardingStatus()
+    {
+        ClaimCallsign("tom", "M0LTE");
+
+        // Outbound to self @ a remote BBS — queued for forwarding (the message the Inbox now hides).
+        Message queued = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["M0LTE"],
+            At = "GB7RDG",
+            Subject = "QUEUED-one",
+            Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.EnqueueForwards(queued.Number, ["GB7RDG"]);
+
+        // Same, but its forward leg has completed.
+        Message forwarded = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            At = "GB7RDG",
+            Subject = "FORWARDED-one",
+            Body = Encoding.Latin1.GetBytes("y\r"),
+        });
+        _store.EnqueueForwards(forwarded.Number, ["GB7RDG"]);
+        _store.MarkForwarded(forwarded.Number, "GB7RDG");
+
+        // A personal I sent to a local user (no @): homed here, no forward leg.
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["2E0XYZ"],
+            Subject = "LOCAL-one",
+            Body = Encoding.Latin1.GetBytes("z\r"),
+        });
+
+        // Mail FROM someone else is not "Sent" by me.
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "G8ABC",
+            Recipients = ["M0LTE"],
+            Subject = "INBOUND-not-mine",
+            Body = Encoding.Latin1.GetBytes("w\r"),
+        });
+
+        using HttpClient client = await StartAsync();
+        string sent = await client.GetStringAsync(new Uri("/sent", UriKind.Relative));
+
+        Assert.Contains("QUEUED-one", sent, StringComparison.Ordinal);
+        Assert.Contains("queued &rarr; GB7RDG", sent, StringComparison.Ordinal);
+        Assert.Contains("FORWARDED-one", sent, StringComparison.Ordinal);
+        Assert.Contains("forwarded", sent, StringComparison.Ordinal);
+        Assert.Contains("LOCAL-one", sent, StringComparison.Ordinal);
+        Assert.Contains("delivered here", sent, StringComparison.Ordinal);
+        // Not my mail — absent from Sent.
+        Assert.DoesNotContain("INBOUND-not-mine", sent, StringComparison.Ordinal);
+    }
+
     // ------------------------------------------------ B2 completeness: Cc + attachment download
 
     [Fact]

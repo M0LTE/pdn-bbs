@@ -86,6 +86,24 @@ public sealed class StatusTransitionTests : IDisposable
     }
 
     [Fact]
+    public void GetMessageForwards_ReportsPerLegSentState()
+    {
+        // Homed locally → no forward legs.
+        Message local = _ts.Store.AddMessage(Drafts.Personal(subject: "local"));
+        Assert.Empty(_ts.Store.GetMessageForwards(local.Number));
+
+        // Two partners; one sent, one still pending.
+        Message m = _ts.Store.AddMessage(Drafts.Personal(subject: "two-legs"));
+        _ts.Store.EnqueueForwards(m.Number, ["GB7AAA", "GB7BPQ"]);
+        _ts.Store.MarkForwarded(m.Number, "GB7AAA");
+
+        IReadOnlyList<MessageForward> legs = _ts.Store.GetMessageForwards(m.Number);
+        Assert.Equal(2, legs.Count);
+        Assert.True(legs.Single(f => f.PartnerCall == "GB7AAA").Forwarded);
+        Assert.False(legs.Single(f => f.PartnerCall == "GB7BPQ").Forwarded);
+    }
+
+    [Fact]
     public void MarkForwarded_SetsFOnlyWhenAllPartnersClear()
     {
         // §2.2: "per-partner bits cleared one at a time; F only when all clear".
