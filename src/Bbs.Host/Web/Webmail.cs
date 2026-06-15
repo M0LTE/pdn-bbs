@@ -1078,9 +1078,9 @@ public static class Webmail
             <textarea name="connectScript" rows="3" cols="48" placeholder="C GB7BPQ">{H(script)}</textarea></label></p>
             <p><label>@ addresses <span class="dim">— routes this partner serves; <code>*</code> is the catch-all default uplink (space-separated)</span><br>
             <input name="at" size="48" value="{H(at)}" placeholder="* or GB7BPQ"></label></p>
-            <p><label>Recipients <span class="dim">— exact TO callsigns to route here (space-separated)</span><br>
-            <input name="to" size="48" value="{H(to)}" placeholder="SYSOP"></label></p>
-            <p><label>Areas <span class="dim">— hierarchical routes for floods + personals, e.g. <code>GBR.EURO</code> (space-separated)</span><br>
+            <p><label>Specific recipients <span class="dim">— send mail addressed TO any of these callsigns out via this partner: a per-user override for when a particular person's mail should always take this link. Usually left empty — the @ address and areas below do the routing. Space-separated.</span><br>
+            <input name="to" size="48" value="{H(to)}" placeholder="(usually empty)"></label></p>
+            <p><label>Areas <span class="dim">— the hierarchical regions this partner relays. A bulletin or message whose <code>@</code> address falls under one of these (e.g. <code>GBR.EURO</code>, or just <code>EURO</code>) is forwarded to this partner. Space-separated.</span><br>
             <input name="hr" size="48" value="{H(hr)}" placeholder="GBR.EURO"></label></p>
             <p><label>Partner address <span class="dim">— the partner's own full HA, needed for flood matching, e.g. <code>GB7BPQ.#23.GBR.EURO</code></span><br>
             <input name="bbsHa" size="48" value="{H(bbsHa)}" placeholder="GB7BPQ.#23.GBR.EURO"></label></p>
@@ -1091,7 +1091,7 @@ public static class Webmail
             <p><label><input type="checkbox" name="enabled" value="1"{(enabled ? " checked" : "")}> Auto-dial enabled <span class="dim">— off ⇒ messages still queue but aren't dialled out</span></label></p>
             <p><label><input type="checkbox" name="sendImmediately" value="1"{(sendImmediately ? " checked" : "")}> Send immediately <span class="dim">— dial as soon as a message is queued for this partner</span></label></p>
             <p><label><input type="checkbox" name="collect" value="1"{(collect ? " checked" : "")}> Collect <span class="dim">— poll on the dial cadence even with an empty queue, to pick up mail a partner that can't dial us holds for us</span></label></p>
-            <p><label><input type="checkbox" name="allowB2" value="1"{(allowB2 ? " checked" : "")}> Allow B2 <span class="dim">— opt in to binary B2 (Winlink/FBB) with this partner; off ⇒ B1 text forwarding</span></label></p>
+            <p><label><input type="checkbox" name="allowB2" value="1"{(allowB2 ? " checked" : "")}> Send binary attachments <span class="dim">— forward file attachments to this partner using the binary "B2" mode (the Winlink/FBB protocol). Leave OFF unless this partner is known to support it (most don't); plain text and 7plus-encoded files forward either way.</span></label></p>
             <p><button type="submit">{(editing ? "Save changes" : "Add partner")}</button> {cancel}</p>
             </fieldset>
             </form>
