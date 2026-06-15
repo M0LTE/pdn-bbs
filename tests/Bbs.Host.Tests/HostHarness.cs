@@ -3,6 +3,7 @@ using Bbs.Core;
 using Bbs.Host.Forwarding;
 using Bbs.Host.Rhp;
 using Bbs.Host.Sessions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 
@@ -29,7 +30,8 @@ internal sealed class HostHarness : IAsyncDisposable
         string bindCallsign = OwnCall,
         bool probeSsid = false,
         string? nodeCallsign = null,
-        string? serviceCallsign = null)
+        string? serviceCallsign = null,
+        ILogger<FbbSessionRunner>? runnerLogger = null)
     {
         _dir = Directory.CreateTempSubdirectory("bbs-host-test-");
         Time = new FakeTimeProvider(new DateTimeOffset(2026, 6, 11, 12, 0, 0, TimeSpan.Zero));
@@ -42,7 +44,7 @@ internal sealed class HostHarness : IAsyncDisposable
         Routing = new RoutingService(Store, Engine, NullLogger<RoutingService>.Instance);
         SevenPlus = new SevenPlusAssembler(Store, NullLogger<SevenPlusAssembler>.Instance);
         Receiver = new InboundMessageReceiver(Store, Routing, Engine, SevenPlus, OwnCall, Time, NullLogger<InboundMessageReceiver>.Instance);
-        Runner = new FbbSessionRunner(Store, Receiver, Identity, Version, Time, NullLogger<FbbSessionRunner>.Instance);
+        Runner = new FbbSessionRunner(Store, Receiver, Identity, Version, Time, runnerLogger ?? NullLogger<FbbSessionRunner>.Instance);
         Link = new RhpNodeLink(
             new RhpLinkOptions
             {

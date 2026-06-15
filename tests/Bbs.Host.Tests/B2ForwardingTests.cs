@@ -377,6 +377,95 @@ public class B2ForwardingTests
     }
 
     [Fact]
+    public async Task B2Session_LogsNegotiatedMode_AndPeerSid_InTemplateOrder()
+    {
+        // Regression for the observability log line: the LogNegotiated delegate's arguments MUST be
+        // passed in the message template's placeholder order — {Partner}, {Mode}, {PeerSid}. A swap
+        // (peerSid where mode was expected) rendered the misleading "negotiated <SID> (peer SID B2)",
+        // which the lab caught but no test did. Drive a real B2 caller cycle and assert the rendered
+        // line reads "... negotiated B2 (peer SID <raw>)".
+        var capture = new CapturingLogger<FbbSessionRunner>();
+        await using var host = new HostHarness(runnerLogger: capture);
+        host.Store.UpsertPartner(new Partner
+        {
+            Call = "GB7BPQ",
+            AllowB2F = true,
+            AtCalls = ["*"],
+            ConnectScript = ["C GB7BPQ-1"],
+            ForwardNewImmediately = true,
+        });
+        await host.StartLinkAsync();
+
+        Message stored = host.Store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal,
+            From = "M0LTE",
+            Recipients = ["G8ABC"],
+            Subject = "B2 log",
+            Body = Encoding.Latin1.GetBytes("body for the negotiated-log test.\r"),
+        });
+        host.Routing.RouteMessage(stored);
+
+        Partner partner = host.Store.GetPartner("GB7BPQ")!;
+        IReadOnlyList<OutboundItem> outbound = OutboundBuilder.Build(
+            host.Store.GetForwardQueue("GB7BPQ"), partner, host.Identity, host.Time, NullLogger.Instance);
+
+        RhpChildConnection child = await host.Link.OpenAsync("GB7BPQ-1", null, host.Token);
+        FakeRhpPeer peer = await host.Server.NextOpenAsync();
+        Task<FbbSessionResult> run = host.Runner.RunCallerAsync(child, partner, outbound, host.Token);
+
+        await peer.SendLineAsync(B2PeerSid);
+        await peer.SendTextAsync("de GB7BPQ>\r");
+        Assert.Equal(OurB2Sid, await peer.ReadLineAsync());
+        Assert.StartsWith("FC EM ", await peer.ReadLineAsync(), StringComparison.Ordinal);
+        await peer.ReadLineAsync(); // F> checksum terminator
+
+        await peer.SendLineAsync("FS +");
+        var reader = new FbbBlockReader();
+        byte[] leftover = await InboundForwardingTests.ReadOneTransferAsync(peer, reader);
+        peer.PushBackForLines(leftover);
+
+        peer.MarkDisconnected();
+        await peer.SendLineAsync("FF");
+
+        FbbSessionResult result = await run.WaitAsync(TestTimeout.Default);
+        Assert.True(result.B2Active);
+
+        string? negotiated = null;
+        int count = 0;
+        foreach (string m in capture.Messages)
+        {
+            if (m.Contains("negotiated", StringComparison.Ordinal))
+            {
+                negotiated = m;
+                count++;
+            }
+        }
+
+        Assert.Equal(1, count); // latched: exactly one negotiated line per session
+        Assert.Equal($"Forwarding session with GB7BPQ negotiated B2 (peer SID {B2PeerSid})", negotiated);
+    }
+
+    /// <summary>Captures rendered log messages so a test can assert the formatted output (e.g. the
+    /// placeholder order of a <see cref="Microsoft.Extensions.Logging.LoggerMessage"/> delegate).</summary>
+    private sealed class CapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Messages.Add(formatter(state, exception));
+    }
+
+    [Fact]
     public async Task OutboundB2Cycle_LinkDropsBeforeBody_LeavesMessageQueued_NotForwarded()
     {
         // The live GB7RDG B2 go-live (2026-06-12) also surfaced this data-loss class: the node

@@ -199,7 +199,8 @@ public sealed class FbbSessionRunner
         }
 
         state.NegotiatedLogged = true;
-        LogNegotiated(_logger, state.PartnerCall, sid.Raw, session.B2Active ? "B2" : "B1", null);
+        // Arg order MUST match the message template's placeholder order: {Partner}, {Mode}, {PeerSid}.
+        LogNegotiated(_logger, state.PartnerCall, session.B2Active ? "B2" : "B1", sid.Raw, null);
     }
 
     private async Task ApplyAsync(
