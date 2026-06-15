@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using Bbs.Core;
 
 namespace Bbs.Fbb;
 
@@ -146,7 +147,11 @@ public sealed record B2Message
         header.Append("\r\n"); // blank line: separates header from body
 
         using var ms = new MemoryStream();
-        var headerBytes = Encoding.ASCII.GetBytes(header.ToString());
+        // UTF-8 egress for the header text: field names + structure are ASCII so
+        // they are byte-identical on the wire; only a non-ASCII VALUE (e.g. a
+        // UTF-8 Subject) carries multibyte bytes. ASCII subjects are unchanged;
+        // a received UTF-8 Subject round-trips byte-for-byte (PacketText).
+        var headerBytes = PacketText.EncodeHeader(header.ToString());
         ms.Write(headerBytes);
         ms.Write(Body.Span);
         ms.Write(Crlf); // mandatory additional terminating CRLF
@@ -160,8 +165,11 @@ public sealed record B2Message
     }
 
     /// <summary>
-    /// Parses a B2F object per the §3.9 tolerance rules: US-ASCII,
-    /// case-insensitive field <em>names</em> (values keep case), <c>Mid:</c>
+    /// Parses a B2F object per the §3.9 tolerance rules: header text is decoded
+    /// UTF-8-when-valid else Latin-1 (field names are ASCII; this only matters
+    /// for non-ASCII values such as a UTF-8 <c>Subject:</c>, see
+    /// <see cref="PacketText"/>), case-insensitive field <em>names</em>
+    /// (values keep case), <c>Mid:</c>
     /// MUST be the first header line, unknown fields ignored, a blank line
     /// separates header from body, the body may not be empty, <c>To:</c>/
     /// <c>Cc:</c> may repeat, and the <c>@MPS@R</c> suffix is stripped from
@@ -332,7 +340,12 @@ public sealed record B2Message
                 i++;
             }
 
-            var line = Encoding.ASCII.GetString(obj.Slice(lineStart, i - lineStart));
+            // Line boundaries are found in the byte domain (CR/LF are single
+            // ASCII bytes that cannot occur inside a UTF-8 multibyte sequence),
+            // so decoding each header line as UTF-8-when-valid else Latin-1 keeps
+            // offsets correct while preserving non-ASCII values such as a UTF-8
+            // Subject (PacketText). Field names + the colon/space are ASCII.
+            var line = PacketText.DecodeHeader(obj.Slice(lineStart, i - lineStart));
 
             // Consume the line terminator (CRLF, or a bare CR/LF — spec §3.13.2).
             if (i < obj.Length && obj[i] == '\r')

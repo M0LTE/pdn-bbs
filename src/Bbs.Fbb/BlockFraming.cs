@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using Bbs.Core;
 
 namespace Bbs.Fbb;
 
@@ -53,7 +54,10 @@ public static class BlockFraming
         }
 
         var offsetText = offset.ToString(CultureInfo.InvariantCulture).PadLeft(6);
-        var titleBytes = Encoding.Latin1.GetBytes(title);
+        // UTF-8 egress: ASCII titles are byte-identical on the wire; a received
+        // UTF-8 title round-trips byte-for-byte (PacketText rationale). The
+        // header length/offset math below uses the ENCODED byte length.
+        var titleBytes = PacketText.EncodeHeader(title);
         var len = titleBytes.Length + offsetText.Length + 2;
         var header = new byte[2 + len];
         header[0] = Soh;
@@ -164,7 +168,7 @@ public sealed class FbbBlockReader
     private bool _skippingPreamble;
     private int _checksumAccumulator;
 
-    /// <summary>The title from the SOH header (Latin-1; available once the header has parsed).</summary>
+    /// <summary>The title from the SOH header (UTF-8-when-valid else Latin-1; available once the header has parsed).</summary>
     public string Title { get; private set; } = "";
 
     /// <summary>The resume offset from the SOH header (0 for a from-scratch transfer).</summary>
@@ -325,7 +329,9 @@ public sealed class FbbBlockReader
             return false; // no title terminator
         }
 
-        Title = Encoding.Latin1.GetString(body, 0, firstNul);
+        // UTF-8-when-valid else Latin-1 (PacketText): a gateway/Winlink UTF-8
+        // title decodes correctly; a legacy Latin-1 high byte still round-trips.
+        Title = PacketText.DecodeHeader(body.AsSpan(0, firstNul));
 
         // Lenient atoi after the title's NUL [BPQ-SRC]: skip whitespace,
         // take optional digits, ignore anything after (incl. the final NUL).
