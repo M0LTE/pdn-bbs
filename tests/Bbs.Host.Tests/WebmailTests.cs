@@ -51,7 +51,7 @@ public sealed class WebmailTests : IAsyncDisposable
 
     private async Task<HttpClient> StartAsync(
         string pdnUser = "tom", bool gatewayHeader = true, string? forwardedPrefix = null, bool autoRedirect = true,
-        int? maxUploadBytes = null, ForwardingStatus? forwarding = null)
+        int? maxUploadBytes = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -68,7 +68,6 @@ public sealed class WebmailTests : IAsyncDisposable
             SysopCallsign = "G0SYS", // distinct from the test users — sysop may read/kill anything
             OnPartnersChanged = () => Interlocked.Increment(ref _partnersChanged),
             OnForwardNow = call => { lock (_forwardNow) { _forwardNow.Add(call); } },
-            Forwarding = forwarding,
         };
         if (maxUploadBytes is { } cap)
         {
@@ -385,11 +384,10 @@ public sealed class WebmailTests : IAsyncDisposable
         ClaimCallsign("tom", "M0LTE");
         _store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
 
-        var forwarding = new ForwardingStatus(_time);
-        forwarding.RecordFailure("GB7RDG", "connect refused");
-        forwarding.RecordFailure("GB7RDG", "connect refused"); // streak → 2
+        _store.RecordForwardingFailure("GB7RDG", "connect refused");
+        _store.RecordForwardingFailure("GB7RDG", "connect refused"); // streak → 2
 
-        using HttpClient client = await StartAsync(forwarding: forwarding);
+        using HttpClient client = await StartAsync();
         string home = await client.GetStringAsync(new Uri("/", UriKind.Relative));
 
         Assert.Contains("failing (2): connect refused", home, StringComparison.Ordinal);                 // Health column
@@ -404,11 +402,10 @@ public sealed class WebmailTests : IAsyncDisposable
         ClaimCallsign("tom", "M0LTE");
         _store.UpsertPartner(new Partner { Call = "GB7RDG", AtCalls = ["*"] });
 
-        var forwarding = new ForwardingStatus(_time);
-        forwarding.RecordFailure("GB7RDG", "connect refused"); // was failing...
-        forwarding.RecordSuccess("GB7RDG");                    // ...then a cycle ran
+        _store.RecordForwardingFailure("GB7RDG", "connect refused"); // was failing...
+        _store.RecordForwardingSuccess("GB7RDG");                    // ...then a cycle ran
 
-        using HttpClient client = await StartAsync(forwarding: forwarding);
+        using HttpClient client = await StartAsync();
         string home = await client.GetStringAsync(new Uri("/", UriKind.Relative));
 
         Assert.Contains("badge on\">ok", home, StringComparison.Ordinal);

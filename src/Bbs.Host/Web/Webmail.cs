@@ -55,13 +55,6 @@ public sealed record WebmailOptions
     /// <summary>The sysop callsign (sysop visibility in webmail), or empty.</summary>
     public string SysopCallsign { get; init; } = "";
 
-    /// <summary>
-    /// Live per-partner forwarding outcomes (the scheduler's <see cref="Bbs.Host.Forwarding.ForwardingStatus"/>),
-    /// so the status dashboard can show a failing/flapping link with its reason rather than a mute
-    /// "waiting". Null in tests/standalone with no scheduler — the dashboard then omits the health column.
-    /// </summary>
-    public Bbs.Host.Forwarding.ForwardingStatus? Forwarding { get; init; }
-
     /// <summary>Rows per page on the inbox/bulletins lists.</summary>
     public int PageSize { get; init; } = 25;
 
@@ -464,7 +457,7 @@ public static class Webmail
 
         foreach (Partner p in partners.OrderBy(p => p.Call, StringComparer.OrdinalIgnoreCase))
         {
-            if (o.Forwarding?.Get(p.Call) is { Ok: false } st)
+            if (o.Store.GetForwardingStatus(p.Call) is { Ok: false } st)
             {
                 alerts.Add(Inv($"Forwarding to {H(p.Call)} is failing ({st.ConsecutiveFailures} attempt{(st.ConsecutiveFailures == 1 ? "" : "s")}): {H(st.Error ?? "unknown error")}"));
             }
@@ -505,7 +498,7 @@ public static class Webmail
             string lastCell = last is { } l ? H(l.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)) : """<span class="dim">never</span>""";
             // The live dial outcome: ok / failing(N): reason / not yet dialled. The whole point of (b) —
             // a failing link reads red here, not as a contented "waiting".
-            PartnerForwardingState? st = o.Forwarding?.Get(p.Call);
+            PartnerForwardingState? st = o.Store.GetForwardingStatus(p.Call);
             string healthCell = st is null
                 ? """<span class="dim">—</span>"""
                 : st.Ok

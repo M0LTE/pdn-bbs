@@ -31,7 +31,6 @@ public sealed class ForwardingScheduler
     private readonly BbsStore _store;
     private readonly BbsIdentity _identity;
     private readonly TimeProvider _time;
-    private readonly ForwardingStatus _status;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<string, Channel<bool>> _nudges = new(StringComparer.OrdinalIgnoreCase);
 
@@ -53,7 +52,6 @@ public sealed class ForwardingScheduler
         BbsStore store,
         BbsIdentity identity,
         TimeProvider time,
-        ForwardingStatus status,
         ILogger<ForwardingScheduler> logger)
     {
         ArgumentNullException.ThrowIfNull(link);
@@ -61,14 +59,12 @@ public sealed class ForwardingScheduler
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(identity);
         ArgumentNullException.ThrowIfNull(time);
-        ArgumentNullException.ThrowIfNull(status);
         ArgumentNullException.ThrowIfNull(logger);
         _link = link;
         _runner = runner;
         _store = store;
         _identity = identity;
         _time = time;
-        _status = status;
         _logger = logger;
 
         foreach (Partner partner in store.ListPartners())
@@ -218,11 +214,11 @@ public sealed class ForwardingScheduler
                 failures = outcome.Graceful ? 0 : failures + 1;
                 if (outcome.Ran)
                 {
-                    _status.RecordSuccess(partner.Call);
+                    _store.RecordForwardingSuccess(partner.Call);
                 }
                 else
                 {
-                    _status.RecordFailure(partner.Call, outcome.Error ?? "could not forward to the partner");
+                    _store.RecordForwardingFailure(partner.Call, outcome.Error ?? "could not forward to the partner");
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -232,7 +228,7 @@ public sealed class ForwardingScheduler
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failures++;
-                _status.RecordFailure(partner.Call, ex.Message);
+                _store.RecordForwardingFailure(partner.Call, ex.Message);
                 LogCycleFailed(_logger, partner.Call, ex.Message, failures, null);
             }
         }

@@ -17,7 +17,7 @@ namespace Bbs.Core;
 public sealed class BbsStore : IDisposable
 {
     /// <summary>The schema version this build writes and expects.</summary>
-    public const int CurrentSchemaVersion = 8;
+    public const int CurrentSchemaVersion = 9;
 
     private readonly SqliteConnection _connection;
     private readonly TimeProvider _time;
@@ -592,6 +592,70 @@ public sealed class BbsStore : IDisposable
             return result is null or DBNull
                 ? null
                 : DateTimeOffset.FromUnixTimeSeconds((long)result);
+        }
+    }
+
+    /// <summary>
+    /// Records a forwarding dial that reached the partner and ran (the link works) — clears the
+    /// failure streak and error. Persisted, so the dashboard health survives a restart.
+    /// </summary>
+    public void RecordForwardingSuccess(string partnerCall)
+    {
+        ArgumentNullException.ThrowIfNull(partnerCall);
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "INSERT INTO forwarding_status(partner_call,last_attempt_utc,ok,error,consecutive_failures) " +
+                "VALUES($p,$now,1,NULL,0) " +
+                "ON CONFLICT(partner_call) DO UPDATE SET last_attempt_utc=$now, ok=1, error=NULL, consecutive_failures=0;");
+            cmd.Parameters.AddWithValue("$p", Callsigns.Normalize(partnerCall));
+            cmd.Parameters.AddWithValue("$now", NowSeconds());
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Records a forwarding dial that failed (could not connect / navigate) with its reason,
+    /// incrementing the partner's consecutive-failure streak. Persisted. The increment is atomic
+    /// (a single UPSERT): the first failure after a success is 1.
+    /// </summary>
+    public void RecordForwardingFailure(string partnerCall, string error)
+    {
+        ArgumentNullException.ThrowIfNull(partnerCall);
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "INSERT INTO forwarding_status(partner_call,last_attempt_utc,ok,error,consecutive_failures) " +
+                "VALUES($p,$now,0,$err,1) " +
+                "ON CONFLICT(partner_call) DO UPDATE SET last_attempt_utc=$now, ok=0, error=$err, " +
+                "consecutive_failures = CASE WHEN forwarding_status.ok=0 THEN forwarding_status.consecutive_failures+1 ELSE 1 END;");
+            cmd.Parameters.AddWithValue("$p", Callsigns.Normalize(partnerCall));
+            cmd.Parameters.AddWithValue("$now", NowSeconds());
+            cmd.Parameters.AddWithValue("$err", (object?)error ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>The partner's last persisted forwarding outcome, or null if it has not been dialled.</summary>
+    public PartnerForwardingState? GetForwardingStatus(string partnerCall)
+    {
+        ArgumentNullException.ThrowIfNull(partnerCall);
+        lock (_gate)
+        {
+            using SqliteCommand cmd = Command(null,
+                "SELECT last_attempt_utc,ok,error,consecutive_failures FROM forwarding_status WHERE partner_call=$p;");
+            cmd.Parameters.AddWithValue("$p", Callsigns.Normalize(partnerCall));
+            using SqliteDataReader reader = cmd.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return new PartnerForwardingState(
+                DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(0)),
+                reader.GetInt64(1) != 0,
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                (int)reader.GetInt64(3));
         }
     }
 
@@ -1770,6 +1834,31 @@ public sealed class BbsStore : IDisposable
             version = 8;
         }
 
+        // v9 — persist per-partner forwarding health so the status dashboard survives a restart
+        // (in-memory it reset to "—" on every restart). PURELY ADDITIVE: a new forwarding_status
+        // table; nothing existing is touched. Created IF NOT EXISTS so re-runs are no-ops.
+        if (version < 9)
+        {
+            using SqliteTransaction tx = connection.BeginTransaction();
+
+            using (var ddl = connection.CreateCommand())
+            {
+                ddl.Transaction = tx;
+                ddl.CommandText = SchemaV9;
+                ddl.ExecuteNonQuery();
+            }
+
+            using (var stamp = connection.CreateCommand())
+            {
+                stamp.Transaction = tx;
+                stamp.CommandText = "UPDATE meta SET value='9' WHERE key='schema_version';";
+                stamp.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            version = 9;
+        }
+
         return version;
     }
 
@@ -1936,6 +2025,18 @@ public sealed class BbsStore : IDisposable
     // message can explain itself in the UI ("too large for <partner>") instead of looking stuck.
     private const string SchemaV8 = """
         ALTER TABLE messages ADD COLUMN hold_reason TEXT;
+        """;
+
+    // v9 — additive only (see Migrate): persisted per-partner forwarding health, so the status
+    // dashboard survives a node restart. One row per partner, upserted on each dial outcome.
+    private const string SchemaV9 = """
+        CREATE TABLE IF NOT EXISTS forwarding_status(
+            partner_call         TEXT PRIMARY KEY,
+            last_attempt_utc     INTEGER NOT NULL,
+            ok                   INTEGER NOT NULL,
+            error                TEXT,
+            consecutive_failures INTEGER NOT NULL
+        );
         """;
 
     private void InsertRecipient(SqliteTransaction tx, long number, string toCall, bool cc)
