@@ -74,6 +74,17 @@ public sealed record FbbSessionConfig
     /// At least one message is always proposed regardless.
     /// </summary>
     public int MaxBlockBytes { get; init; } = ProposalBlock.DefaultMaxBlockBytes;
+
+    /// <summary>
+    /// Optional peer-scoped store of partial INBOUND transfers for receiver-side restart granting
+    /// (issue #38 / compat spec §3.8). When set, an accepted inbound proposal whose message id we
+    /// already hold a partial for is granted <c>FS !offset</c> instead of <c>+</c>, the held bytes
+    /// are reused, and each received block is persisted so an interrupted transfer can resume on a
+    /// later attempt; the partial is discarded on clean commit or divergence. <see langword="null"/>
+    /// (the default) disables resume — every accept is a from-zero receive, the pre-#38 behaviour.
+    /// Only meaningful on the receive side; harmless on a session that never receives.
+    /// </summary>
+    public IInboundResumeStore? InboundResume { get; init; }
 }
 
 /// <summary>
@@ -106,6 +117,13 @@ public sealed class FbbSession
     private readonly List<Proposal> _pendingInbound = [];
     private readonly List<string> _pendingInboundRaw = [];
     private readonly Queue<Proposal> _acceptedInbound = new();
+
+    // For each accepted inbound proposal (parallel to _acceptedInbound), the compressed prefix we
+    // already hold from an earlier interrupted attempt — empty for a from-zero receive. When a
+    // resume was granted (FS !offset) the peer re-sends only the tail, so on completion the full
+    // compressed image is this prefix concatenated with the reader's tail payload (issue #38).
+    private readonly Queue<byte[]> _acceptedResumePrefix = new();
+    private byte[] _currentResumePrefix = [];
 
     private FbbBlockReader? _reader;
     private List<FbbOutboundMessage>? _proposedBatch;
@@ -222,6 +240,7 @@ public sealed class FbbSession
         }
 
         var final = new FsAnswer[_pendingInbound.Count];
+        var resumePrefix = new byte[_pendingInbound.Count][];
         for (var i = 0; i < final.Length; i++)
         {
             // The per-proposal limit class: an oversize TO gets a polite '-'
@@ -229,6 +248,17 @@ public sealed class FbbSession
             final[i] = _pendingInbound[i] is FaProposal { RequiresPoliteReject: true }
                 ? FsAnswer.AlreadyHave
                 : decisions.Answers[i];
+            resumePrefix[i] = [];
+
+            // Receiver-side restart granting (issue #38 / spec §3.8): if the host plainly accepts
+            // and we hold a trustworthy partial for this message id, upgrade '+' to '!offset' and
+            // remember the held compressed prefix so completion reconstructs the full image.
+            if (final[i].Kind == FsAnswerKind.Accept && final[i].Offset == 0
+                && TryResume(_pendingInbound[i], out byte[] held))
+            {
+                resumePrefix[i] = held;
+                final[i] = FsAnswer.AcceptFromOffset(held.Length - 6);
+            }
         }
 
         actions.Add(new FbbSendLine(FsResponse.Emit(final)));
@@ -237,6 +267,7 @@ public sealed class FbbSession
             if (final[i].Kind == FsAnswerKind.Accept)
             {
                 _acceptedInbound.Enqueue(_pendingInbound[i]);
+                _acceptedResumePrefix.Enqueue(resumePrefix[i]);
             }
         }
 
@@ -244,6 +275,7 @@ public sealed class FbbSession
         _pendingInboundRaw.Clear();
         if (_acceptedInbound.Count > 0)
         {
+            _currentResumePrefix = _acceptedResumePrefix.Dequeue();
             _reader = new FbbBlockReader();
             Phase = FbbSessionPhase.ReceivingMessages;
         }
@@ -656,30 +688,50 @@ public sealed class FbbSession
         switch (status)
         {
             case FbbBlockReaderStatus.NeedMoreData:
+                // Stage the bytes received so far so an interrupted transfer can resume on a later
+                // attempt (issue #38). The persisted prefix is the held resume prefix (for a session
+                // already resuming) plus the reader's tail-so-far — i.e. the full compressed image
+                // prefix, header included. Only persist once a block has actually contributed
+                // payload (Offset>0 marks a resume in progress, whose prefix we must keep recording).
+                if (consumed > 0 && _acceptedInbound.Count > 0)
+                {
+                    SaveProgress(_acceptedInbound.Peek(), reader);
+                }
+
                 return false;
 
             case FbbBlockReaderStatus.Complete:
                 var proposal = _acceptedInbound.Dequeue();
+                // Reconstruct the full compressed image: the prefix we already held (empty unless we
+                // granted a resume — then the peer re-sent only the tail) followed by this transfer's
+                // payload. For a from-zero accept the prefix is empty and this is just reader.Payload.
+                byte[] fullCompressed = Concat(_currentResumePrefix, reader.Payload.Span);
                 byte[] body;
                 try
                 {
-                    body = LzhufContainer.Decode(_container, reader.Payload.Span);
+                    body = LzhufContainer.Decode(_container, fullCompressed);
                 }
                 catch (LzhufFormatException)
                 {
-                    // The container CRC16/format failing is the same wire
-                    // failure class as a bad EOT checksum (spec §3.7/§3.12).
+                    // The container CRC16/format failing is the same wire failure class as a bad EOT
+                    // checksum (spec §3.7/§3.12). A divergent resume would surface here too — drop the
+                    // (now untrustworthy) partial so a later attempt re-receives cleanly from zero.
+                    DiscardPartial(proposal);
                     FailWithError(MessageChecksumErrorLine, actions);
                     return false;
                 }
 
+                // Committed: the message is delivered to the host, so the staged partial is done.
+                DiscardPartial(proposal);
                 actions.Add(new FbbMessageDelivered(proposal, reader.Title, body));
                 if (_acceptedInbound.Count > 0)
                 {
+                    _currentResumePrefix = _acceptedResumePrefix.Dequeue();
                     _reader = new FbbBlockReader();
                 }
                 else
                 {
+                    _currentResumePrefix = [];
                     _reader = null;
 
                     // "When the other BBS has received all the messages in a
@@ -699,6 +751,90 @@ public sealed class FbbSession
                 FailWithError(MessageChecksumErrorLine, actions);
                 return false;
         }
+    }
+
+    /// <summary>
+    /// The message id a proposal carries for partial-store keying and dedup — the FA <c>BID</c> or
+    /// the FC <c>MID</c>, the network-wide dedup identity (spec §2.3/§3.9). Null for proposal shapes
+    /// that carry no id (none today; defensive).
+    /// </summary>
+    private static string? MessageId(Proposal proposal) => proposal switch
+    {
+        FaProposal fa => fa.Bid,
+        FcProposal fc => fc.Mid,
+        _ => null,
+    };
+
+    /// <summary>
+    /// Decides whether to grant a restart for <paramref name="proposal"/>: a trustworthy persisted
+    /// partial exists (issue #38 / spec §3.8). Trustworthy = at least 7 bytes (the 6-byte header
+    /// plus one tail byte, so the granted offset is ≥1) and, for an FC whose proposal advertises the
+    /// compressed object size, that size still matches what we are mid-receiving (a divergence guard —
+    /// a changed object can't be resumed onto stale bytes). On success <paramref name="held"/> is the
+    /// compressed prefix to reuse; otherwise it is empty and the caller accepts from zero.
+    /// </summary>
+    private bool TryResume(Proposal proposal, out byte[] held)
+    {
+        held = [];
+        if (_config.InboundResume is not { } store
+            || _container != LzhufContainerKind.B1
+            || MessageId(proposal) is not { Length: > 0 } id
+            || store.TryLoad(id) is not { } partial)
+        {
+            return false;
+        }
+
+        byte[] bytes = partial.Compressed;
+        if (bytes.Length < 7)
+        {
+            return false; // too little held to save a meaningful resend
+        }
+
+        // Divergence guard: an FC advertises the compressed size; if the re-offered object is a
+        // different size than we hold a partial for, the partial is stale — drop it, receive afresh.
+        if (proposal is FcProposal fc && fc.CompressedSize > 0 && fc.CompressedSize < bytes.Length)
+        {
+            store.Discard(id);
+            return false;
+        }
+
+        held = bytes;
+        return true;
+    }
+
+    /// <summary>Persists the compressed bytes received so far for the in-flight inbound message (issue #38).</summary>
+    private void SaveProgress(Proposal proposal, FbbBlockReader reader)
+    {
+        if (_config.InboundResume is not { } store || MessageId(proposal) is not { Length: > 0 } id)
+        {
+            return;
+        }
+
+        byte[] soFar = Concat(_currentResumePrefix, reader.Payload.Span);
+        int expected = proposal is FcProposal fc ? fc.CompressedSize : 0;
+        store.Save(id, soFar, expected);
+    }
+
+    /// <summary>Drops the staged partial for a committed-or-untrustworthy message (issue #38).</summary>
+    private void DiscardPartial(Proposal proposal)
+    {
+        if (_config.InboundResume is { } store && MessageId(proposal) is { Length: > 0 } id)
+        {
+            store.Discard(id);
+        }
+    }
+
+    private static byte[] Concat(byte[] prefix, ReadOnlySpan<byte> tail)
+    {
+        if (prefix.Length == 0)
+        {
+            return tail.ToArray();
+        }
+
+        var combined = new byte[prefix.Length + tail.Length];
+        prefix.CopyTo(combined.AsSpan());
+        tail.CopyTo(combined.AsSpan(prefix.Length));
+        return combined;
     }
 
     private void TakeTurn(List<FbbAction> actions, bool peerSaidFf)

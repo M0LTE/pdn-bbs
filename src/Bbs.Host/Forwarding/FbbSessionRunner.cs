@@ -29,18 +29,26 @@ public sealed class FbbSessionRunner
     private readonly string _sidVersion;
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
+    private readonly FileInboundPartialStore? _partialStore;
 
     /// <summary>A silent peer ends the session after this long (TimeProvider-driven).</summary>
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromMinutes(10);
 
     /// <summary>Creates the runner.</summary>
+    /// <param name="partialStore">
+    /// The durable scratch store for receiver-side restart granting (issue #38). When supplied, an
+    /// inbound session is given a peer-scoped resume view so an interrupted transfer can be granted
+    /// <c>FS !offset</c> on a re-offer. Null (the default for tests/standalone) disables resume —
+    /// every accept is a from-zero receive, the pre-#38 behaviour.
+    /// </param>
     public FbbSessionRunner(
         BbsStore store,
         InboundMessageReceiver receiver,
         BbsIdentity identity,
         string sidVersion,
         TimeProvider time,
-        ILogger<FbbSessionRunner> logger)
+        ILogger<FbbSessionRunner> logger,
+        FileInboundPartialStore? partialStore = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(receiver);
@@ -54,6 +62,7 @@ public sealed class FbbSessionRunner
         _sidVersion = sidVersion;
         _time = time;
         _logger = logger;
+        _partialStore = partialStore;
     }
 
     /// <summary>
@@ -131,6 +140,14 @@ public sealed class FbbSessionRunner
                 // advertises it (B2Active = our offer ∩ the peer SID — spec §3.2/§3.9). An
                 // unknown caller (no partner record) is never B2-allowed, so its FC is refused.
                 OfferB2 = partner?.AllowB2F ?? false,
+
+                // Receiver-side restart granting (issue #38): give the session a peer-scoped view of
+                // the durable partial store, so an interrupted inbound transfer for this peer can be
+                // granted FS !offset on a re-offer. Keyed by base callsign (the partial survives an
+                // SSID change / a restart). Null store (tests/standalone) → no resume, pre-#38 behaviour.
+                InboundResume = _partialStore is { } ps && !string.IsNullOrWhiteSpace(partnerCall)
+                    ? ps.ForPeer(partnerCall)
+                    : null,
             },
             outbound.Select(o => o.Wire));
 
