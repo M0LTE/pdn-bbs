@@ -50,11 +50,22 @@ When the node finds the same app `id` under both roots, **the later root wins** 
 
 Neither the `.deb` nor `scripts/deploy-bbs.sh` touches `/var/lib` — they only install code under `/usr/share`, and `/var/lib` is left entirely to state (`bbs.db`, `bbs.yaml`, `*.db-wal`/`*.db-shm`). The one box that had the old hand-staged layout (the lab) was migrated off it **once, by hand**: strip exactly `pdn-bbs` + `pdn-app.yaml` from `/var/lib/packetnet/apps/bbs/`, keep the state. After that `/usr/share` is authoritative and every future `.deb` upgrades the code in place. (This is a one-off, not codified — a normal install is `/usr/share`-only from the start.)
 
-## The two entry points
+## The three entry points
 
-### Release — `.github/workflows/publish-bbs.yml`
+### Auto-release on merge — `.github/workflows/ci.yml` (the `release` job)
 
-Triggered by a `v*` tag (or a manual `workflow_dispatch` with an explicit version). Runs on `[self-hosted, Linux, X64]` (no GitHub-hosted runners — this repo has no hosted-runner budget). Resolves the version from the tag (`${GITHUB_REF#refs/tags/v}`) or the dispatch input, loops the three RIDs through `scripts/build-deb.sh`, `sha256sum`s the three `.deb`s into `SHA256SUMS`, and `gh release create`s the tag with the three `.deb`s + `SHA256SUMS`.
+The hands-off path, modelled on dapps: **version is the single source of truth** (the `version:` field in `pdn-app.yaml` — the same field the `.deb` stamps and pdn shows in its UI), and **merge → release**. Bump `version:` in the PR you want released; when it lands on `main` and both the `test` and `interop` jobs pass, the `release` job reads the version, checks whether a Release for `v$VERSION` already exists, and — only if it does **not** — loops the three RIDs through `scripts/build-deb.sh`, `sha256sum`s the `.deb`s into `SHA256SUMS`, and `gh release create`s the tag with the three `.deb`s + `SHA256SUMS` + auto-generated notes.
+
+Don't bump the version → the merge lands as a normal commit, no release. The **same version twice is a no-op** (the release-already-exists guard), so re-runs and unrelated pushes are safe. This is the dapps idempotence model applied to pdn-bbs's existing `.deb` packaging.
+
+```
+# in the PR:   pdn-app.yaml  version: "0.2.34" → "0.2.35"
+git merge / merge the PR to main              # → CI builds amd64/arm64/armhf, cuts v0.2.35
+```
+
+### Manual release — `.github/workflows/publish-bbs.yml`
+
+The escape hatch when you want to cut a release without a version-bump PR. Triggered by a `v*` tag (or a manual `workflow_dispatch` with an explicit version). Runs on `[self-hosted, Linux, X64]` (no GitHub-hosted runners — this repo has no hosted-runner budget). Resolves the version from the tag (`${GITHUB_REF#refs/tags/v}`) or the dispatch input, loops the three RIDs through `scripts/build-deb.sh`, `sha256sum`s the three `.deb`s into `SHA256SUMS`, and `gh release create`s the tag with the three `.deb`s + `SHA256SUMS`. (Same packaging as the auto-release job, so the two paths produce identical artifacts.)
 
 ```
 git tag v0.1.0 && git push origin v0.1.0      # → builds amd64/arm64/armhf, cuts the release

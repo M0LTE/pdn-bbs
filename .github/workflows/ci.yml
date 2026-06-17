@@ -4,9 +4,17 @@ on:
     branches: [main]
   pull_request:
 
+# `contents: write` is needed by the auto-release job (it cuts a GitHub Release on a
+# version bump landing on main). PRs never get it — the release job is push-to-main only.
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: [self-hosted, Linux, X64]
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      should_release: ${{ steps.decide.outputs.should_release }}
     steps:
       - name: Pre-checkout — clear root-owned oracle state (self-heal interrupted runs)
         # The interop lane's LinBPQ container writes docker/oracle/state as root.
@@ -28,6 +36,35 @@ jobs:
         run: dotnet build -c Release
       - name: Test
         run: dotnet test -c Release --no-build --filter "Category!=Interop"
+
+      # Version is the single source of truth in pdn-app.yaml (`version:`) — the same field the .deb
+      # stamps and pdn shows in its UI. Bump it in the PR you want released; merge → release. Don't
+      # bump it → the merge lands as a normal commit, no release. (Mirrors dapps' merge-to-release.)
+      - id: version
+        name: Read version (pdn-app.yaml)
+        run: |
+          v=$(sed -nE 's/^version:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/p' pdn-app.yaml | head -n1)
+          if [ -z "$v" ]; then echo "could not read version: from pdn-app.yaml" >&2; exit 1; fi
+          echo "value=${v}" >> "$GITHUB_OUTPUT"
+          echo "version: ${v}"
+
+      - id: decide
+        name: Decide release
+        # Only on a push to main (PRs just verify the build/test path). A release for this version
+        # already existing → no-op (the same idempotence dapps relies on: same version twice = second
+        # push does nothing). This is what makes "version is the source of truth" safe.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.version.outputs.value }}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists — skipping release."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Will publish $tag."
+          fi
 
   interop:
     # The oracle lane: real bidirectional FBB forwarding against the live
@@ -81,3 +118,57 @@ jobs:
             -v "$PWD/docker/oracle/state:/data" \
             m0lte/linbpq@sha256:872343ffb76a52316b1ae42a42d3c0893f545ccd577301ebc7c4455b292a8025 \
             -c 'rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null; true' || true
+
+  # Auto-release on a version bump landing on main (the dapps model: version is the single source of
+  # truth in pdn-app.yaml, merge → release, same-version-twice = no-op). Builds the three .debs from
+  # scripts/build-deb.sh — the SAME packaging publish-bbs.yml uses — and attaches them to a GitHub
+  # Release. publish-bbs.yml stays as the manual escape hatch (tag push / workflow_dispatch); this is
+  # the hands-off path so a normal "bump + merge" PR ships without anyone cutting a tag by hand.
+  #
+  # Gated on BOTH test and interop passing: we don't ship a build that fails the oracle lane. No
+  # Actions artifacts (the .debs are built + attached from this one job's local tree, never touching
+  # the artifact store — mirrors publish-bbs.yml / publish-node.yml's free-tier quota dodge).
+  release:
+    needs: [test, interop]
+    if: needs.test.outputs.should_release == 'true'
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: write
+    steps:
+      - name: Pre-checkout — clear root-owned oracle state (self-heal interrupted runs)
+        # Same root-owned docker/oracle/state hazard the other jobs guard against (see the test job):
+        # clear it in a throwaway root container before actions/checkout --clean hits EACCES.
+        run: |
+          state="$GITHUB_WORKSPACE/docker/oracle/state"
+          if [ -d "$state" ]; then
+            docker run --rm --entrypoint /bin/sh \
+              -v "$state:/data" \
+              m0lte/linbpq@sha256:872343ffb76a52316b1ae42a42d3c0893f545ccd577301ebc7c4455b292a8025 \
+              -c 'rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null; true' || true
+          fi
+      - uses: actions/checkout@v4
+
+      # dotnet is pre-installed on the self-hosted runners (as in publish-bbs.yml); setup-dotnet@v4
+      # fails on them ("mkdir: Permission denied"). Use the runner's SDK directly.
+      - name: dotnet version
+        run: dotnet --version
+
+      - name: Build .debs (amd64 / arm64 / armhf)
+        env:
+          VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          for rid in linux-x64 linux-arm64 linux-arm; do
+            scripts/build-deb.sh "$rid" "$VERSION"
+          done
+
+      - name: Checksum + create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          ( cd artifacts && sha256sum pdn-bbs_*.deb > SHA256SUMS && ls -l pdn-bbs_*.deb SHA256SUMS )
+          gh release create "v${VERSION}" artifacts/pdn-bbs_*.deb artifacts/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "pdn-bbs v${VERSION}" \
+            --generate-notes
