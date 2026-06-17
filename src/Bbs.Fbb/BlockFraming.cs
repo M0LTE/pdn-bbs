@@ -164,8 +164,12 @@ public sealed class FbbBlockReader
     private State _state = State.ExpectSoh;
     private int _headerLength;
     private int _blockRemaining;
-    private bool _firstBlock = true;
-    private bool _skippingPreamble;
+    // On a resumed transfer (SOH Offset>0) the first 6 PAYLOAD bytes are the repeated container
+    // header (spec §3.8: "resend bytes 0-5 then from n+6") — counted in the checksum but dropped
+    // from the reassembled payload. This is a per-BYTE count, not a per-block flag, so it is robust
+    // whether the sender frames those 6 bytes as a standalone STX block (BPQ's quirk) or as the head
+    // of a larger block (our own encoder packs the whole payload into 250-byte blocks).
+    private int _preambleSkipRemaining;
     private int _checksumAccumulator;
 
     /// <summary>The title from the SOH header (UTF-8-when-valid else Latin-1; available once the header has parsed).</summary>
@@ -236,6 +240,10 @@ public sealed class FbbBlockReader
                             return FbbBlockReaderStatus.FramingError;
                         }
 
+                        // A resumed transfer (Offset>0) repeats the 6-byte container header at the
+                        // start of the payload; arm the per-byte skip so those bytes are checksummed
+                        // but excluded from the reassembled payload (spec §3.8).
+                        _preambleSkipRemaining = Offset > 0 ? 6 : 0;
                         _state = State.ExpectMarker;
                     }
 
@@ -262,13 +270,6 @@ public sealed class FbbBlockReader
                 case State.BlockLength:
                     consumed++;
                     _blockRemaining = b == 0 ? 256 : b; // length byte 0 = 256 (spec §3.6)
-
-                    // BPQ's restart quirk: a resumed transfer opens with a
-                    // 6-byte STX block repeating the original CRC+length;
-                    // skip its payload but keep it in the checksum
-                    // (spec §3.8, [VERIFY-ORACLE #12]).
-                    _skippingPreamble = _firstBlock && Offset > 0 && _blockRemaining == 6;
-                    _firstBlock = false;
                     _state = State.BlockData;
                     break;
 
@@ -278,7 +279,14 @@ public sealed class FbbBlockReader
                     {
                         var pb = data[consumed + i];
                         _checksumAccumulator += pb;
-                        if (!_skippingPreamble)
+
+                        // On a resumed transfer, drop the leading 6 repeated-header bytes from the
+                        // reassembled payload (still counted in the checksum above) — spec §3.8.
+                        if (_preambleSkipRemaining > 0)
+                        {
+                            _preambleSkipRemaining--;
+                        }
+                        else
                         {
                             _payload.Add(pb);
                         }

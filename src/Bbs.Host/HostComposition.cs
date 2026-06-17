@@ -124,9 +124,14 @@ public static class HostComposition
             store, sp.GetRequiredService<RoutingService>(), engine,
             sp.GetRequiredService<SevenPlusAssembler>(), baseCallsign, time,
             sp.GetRequiredService<ILogger<InboundMessageReceiver>>()));
+        // Durable scratch area for receiver-side restart granting (issue #38). Sweep abandoned
+        // partials at startup so the area cannot grow unbounded across restarts.
+        var partialStore = new FileInboundPartialStore(stateDir, time);
+        partialStore.CollectStale();
+        builder.Services.AddSingleton(partialStore);
         builder.Services.AddSingleton(sp => new FbbSessionRunner(
             store, sp.GetRequiredService<InboundMessageReceiver>(), identity, version, time,
-            sp.GetRequiredService<ILogger<FbbSessionRunner>>()));
+            sp.GetRequiredService<ILogger<FbbSessionRunner>>(), partialStore));
         builder.Services.AddSingleton(sp => new ForwardingScheduler(
             sp.GetRequiredService<RhpNodeLink>(), sp.GetRequiredService<FbbSessionRunner>(), store, identity, time,
             sp.GetRequiredService<ILogger<ForwardingScheduler>>()));
