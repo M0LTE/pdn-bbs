@@ -60,6 +60,14 @@ public sealed record BbsHostConfig
     /// <summary>The node's RHPv2 endpoint.</summary>
     public RhpConfig Rhp { get; init; } = new();
 
+    /// <summary>
+    /// Housekeeping lifetime defaults + the MaxMsgno ceiling (issue #39). Every field is optional;
+    /// an omitted field keeps the built-in default (bulletins ~7 days, personals/NTS ~30 days,
+    /// renumbering disabled). The whole block may be absent — an upgraded node then behaves exactly
+    /// as the built-in defaults, with no surprise mass-deletion on first run.
+    /// </summary>
+    public HousekeepingConfig Housekeeping { get; init; } = new();
+
     /// <summary>Forwarding partners — the source of truth for partner config (v1); upserted into the store at startup.</summary>
     /// <remarks>Concrete <see cref="List{T}"/> because YamlDotNet binds collections, not read-only interfaces.</remarks>
     public List<PartnerConfig> Partners { get; init; } = [];
@@ -230,6 +238,84 @@ public sealed record RhpConfig
 
     /// <summary>RHP auth password.</summary>
     public string? Pass { get; init; }
+}
+
+/// <summary>
+/// Per-node housekeeping overrides (issue #39 / compat spec §6). EVERY field is nullable: an unset
+/// field (or an absent <c>housekeeping:</c> block) keeps the corresponding built-in
+/// <see cref="HousekeepingPolicy"/> default — bulletins ~7 days, personals + NTS ~30 days, BID
+/// lifetime 60 days, kill-purge grace 0, renumbering OFF. This is how the per-class lifetime defaults
+/// become overridable per node WITHOUT a code change, and it guarantees an upgraded node behaves
+/// exactly as the built-in defaults until the operator opts into a change. Lifetimes are in DAYS.
+/// </summary>
+public sealed record HousekeepingConfig
+{
+    /// <summary>Read (Y) personal lifetime, days; null → built-in default.</summary>
+    public int? PersonalReadDays { get; init; }
+
+    /// <summary>Unread (N, no forward pending) personal lifetime, days; null → built-in default.</summary>
+    public int? PersonalUnreadDays { get; init; }
+
+    /// <summary>Forwarded (F) personal lifetime, days; null → built-in default.</summary>
+    public int? PersonalForwardedDays { get; init; }
+
+    /// <summary>Unforwarded (N with forward pending) personal lifetime, days; null → built-in default.</summary>
+    public int? PersonalUnforwardedDays { get; init; }
+
+    /// <summary>Forwarded (F) bulletin lifetime, days; null → built-in default (~7).</summary>
+    public int? BulletinForwardedDays { get; init; }
+
+    /// <summary>Unforwarded (N/Y/$) bulletin lifetime, days; null → built-in default (~7).</summary>
+    public int? BulletinUnforwardedDays { get; init; }
+
+    /// <summary>Delivered (D) NTS lifetime, days; null → built-in default.</summary>
+    public int? NtsDeliveredDays { get; init; }
+
+    /// <summary>Forwarded (F) NTS lifetime, days; null → built-in default.</summary>
+    public int? NtsForwardedDays { get; init; }
+
+    /// <summary>Unforwarded (N/Y) NTS lifetime, days; null → built-in default.</summary>
+    public int? NtsUnforwardedDays { get; init; }
+
+    /// <summary>BID dedup-record lifetime, days; null → built-in default (60).</summary>
+    public int? BidLifetimeDays { get; init; }
+
+    /// <summary>Grace between kill and physical delete, days; null → built-in default (0 = next run).</summary>
+    public int? KilledPurgeGraceDays { get; init; }
+
+    /// <summary>
+    /// Message-number ceiling (BPQ <c>MaxMsgno</c>); null or 0 → renumbering disabled (the default).
+    /// When positive, a housekeeping run whose highest live number reaches it compacts the surviving
+    /// messages densely from 1 (the network BID is never rewritten). See
+    /// <see cref="HousekeepingPolicy.MaxMsgno"/>.
+    /// </summary>
+    public long? MaxMsgno { get; init; }
+
+    /// <summary>
+    /// Builds the Core <see cref="HousekeepingPolicy"/>, substituting the built-in default for every
+    /// unset field. A negative value is clamped to its default (a lifetime can never be negative).
+    /// </summary>
+    public HousekeepingPolicy ToPolicy()
+    {
+        var defaults = new HousekeepingPolicy();
+        return defaults with
+        {
+            PersonalReadDays = NonNegativeOr(PersonalReadDays, defaults.PersonalReadDays),
+            PersonalUnreadDays = NonNegativeOr(PersonalUnreadDays, defaults.PersonalUnreadDays),
+            PersonalForwardedDays = NonNegativeOr(PersonalForwardedDays, defaults.PersonalForwardedDays),
+            PersonalUnforwardedDays = NonNegativeOr(PersonalUnforwardedDays, defaults.PersonalUnforwardedDays),
+            BulletinForwardedDays = NonNegativeOr(BulletinForwardedDays, defaults.BulletinForwardedDays),
+            BulletinUnforwardedDays = NonNegativeOr(BulletinUnforwardedDays, defaults.BulletinUnforwardedDays),
+            NtsDeliveredDays = NonNegativeOr(NtsDeliveredDays, defaults.NtsDeliveredDays),
+            NtsForwardedDays = NonNegativeOr(NtsForwardedDays, defaults.NtsForwardedDays),
+            NtsUnforwardedDays = NonNegativeOr(NtsUnforwardedDays, defaults.NtsUnforwardedDays),
+            BidLifetimeDays = NonNegativeOr(BidLifetimeDays, defaults.BidLifetimeDays),
+            KilledPurgeGraceDays = NonNegativeOr(KilledPurgeGraceDays, defaults.KilledPurgeGraceDays),
+            MaxMsgno = MaxMsgno is { } ceiling && ceiling > 0 ? ceiling : defaults.MaxMsgno,
+        };
+
+        static int NonNegativeOr(int? value, int fallback) => value is { } v && v >= 0 ? v : fallback;
+    }
 }
 
 /// <summary>
@@ -674,6 +760,43 @@ public static class BbsHostConfigFile
           user: null
           pass: null
 
+        # housekeeping: per-class message lifetimes + the message-number ceiling
+        #               (the daily kill-by-age / renumber pass, compat spec §6).
+        #   Every key below is OPTIONAL — an omitted key (or an absent housekeeping:
+        #   block entirely) keeps the built-in default, so upgrading a node changes
+        #   nothing until you set a key. Lifetimes are in DAYS; a message is killed
+        #   when STRICTLY older than its lifetime, and a killed (K) message is
+        #   physically removed at a later run (killedPurgeGraceDays after the kill).
+        #   Held (H) messages are exempt from every lifetime — a hold protects a
+        #   message from age-out.
+        #
+        #   Defaults: bulletins ~7 days (transient broadcast traffic), personals and
+        #   NTS traffic ~30 days, BID dedup records 60 days, kill-purge grace 0
+        #   (purge at the next run). Set the bulletin keys to 30 for the old uniform
+        #   behaviour.
+        #
+        #   maxMsgno: the message-number ceiling (BPQ MaxMsgno). 0 (the default)
+        #             disables renumbering. When positive, a housekeeping run whose
+        #             highest live message number has reached it RENUMBERS the
+        #             surviving messages densely from 1 (oldest→newest) so the next
+        #             number is well below the ceiling again. The network message id
+        #             (BID, "<n>_<BBSCALL>") is a fixed network identity and is NEVER
+        #             rewritten — only the local message number and the local rows
+        #             that reference it move, so partners and dedup are unaffected.
+        # housekeeping:
+        #   personalReadDays: 30
+        #   personalUnreadDays: 30
+        #   personalForwardedDays: 30
+        #   personalUnforwardedDays: 30
+        #   bulletinForwardedDays: 7
+        #   bulletinUnforwardedDays: 7
+        #   ntsDeliveredDays: 30
+        #   ntsForwardedDays: 30
+        #   ntsUnforwardedDays: 30
+        #   bidLifetimeDays: 60
+        #   killedPurgeGraceDays: 0
+        #   maxMsgno: 0            # 0 = no renumbering; e.g. 9000000 to cap like BPQ
+
         # partners: BBS forwarding partners (compat spec §4.1, v1 subset).
         #
         # Delivery posture: mail moves because whoever HOLDS it dials at once
@@ -845,6 +968,12 @@ public static class BbsHostConfigFile
           port: null
           user: null
           pass: null
+
+        # housekeeping: per-class message lifetimes + the MaxMsgno renumber ceiling
+        #               (see the standalone default's comments for the full key
+        #               reference). Every key is optional; omit the block to keep the
+        #               built-in defaults (bulletins ~7 days, personals/NTS ~30 days,
+        #               renumbering off). Left at the defaults here.
 
         # partners: BBS forwarding partners (compat spec §4.1, v1 subset). See the standalone
         # default's comments for the full key reference; left empty here.

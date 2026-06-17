@@ -3,39 +3,58 @@ namespace Bbs.Core;
 /// <summary>
 /// Lifetimes for the housekeeping run (compat spec §6): kill-by-age per type+state —
 /// "Personals Read/Unread/Forwarded/Unforwarded, Bulls Forwarded/Unforwarded, NTS
-/// Delivered/Forwarded/Unforwarded (all default 30 in current code)" — BID Lifetime
-/// (default 60), and the grace before killed messages are physically removed (default 0 =
-/// at the next run, matching LinBPQ's "first physically remove K-status messages").
+/// Delivered/Forwarded/Unforwarded" — BID Lifetime (default 60), the grace before killed
+/// messages are physically removed (default 0 = at the next run, matching LinBPQ's "first
+/// physically remove K-status messages"), and the message-number ceiling
+/// (<see cref="MaxMsgno"/>) that triggers a compacting renumber.
 /// All values in days; a message is killed when strictly older than its lifetime.
+///
+/// <para><b>Per-class lifetime defaults (issue #39 / forwarding.md "Housekeeping lifetime
+/// defaults"):</b> bulletins default to <b>7 days</b> (the GB7RDG convention — transient
+/// broadcast traffic that should not inflate the store for a month); personals and NTS
+/// traffic default to <b>30 days</b>. Every value is config-overridable per node through the
+/// <c>housekeeping:</c> block in <c>bbs.yaml</c> (no code change), so an operator who wants
+/// the old uniform-30 behaviour just sets the bulletin keys to 30. Held (H) messages are
+/// exempt from every lifetime (they sit in the sysop's queue, §2.2) and a hold flag therefore
+/// already protects a deliberately-kept message from the per-class defaults.</para>
 /// </summary>
 public sealed record HousekeepingPolicy
 {
+    /// <summary>The conventional lifetime for personal mail + NTS traffic, days.</summary>
+    public const int DefaultPersonalDays = 30;
+
+    /// <summary>
+    /// The conventional lifetime for bulletins, days — markedly shorter than personals because a
+    /// bulletin is transient broadcast traffic (the GB7RDG convention ~7 days; issue #39).
+    /// </summary>
+    public const int DefaultBulletinDays = 7;
+
     /// <summary>Lifetime of read (Y) personals, days.</summary>
-    public int PersonalReadDays { get; init; } = 30;
+    public int PersonalReadDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>Lifetime of unread (N, no forwarding pending) personals, days.</summary>
-    public int PersonalUnreadDays { get; init; } = 30;
+    public int PersonalUnreadDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>Lifetime of forwarded (F) personals, days.</summary>
-    public int PersonalForwardedDays { get; init; } = 30;
+    public int PersonalForwardedDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>Lifetime of unforwarded personals (N with forwarding still pending), days.</summary>
-    public int PersonalUnforwardedDays { get; init; } = 30;
+    public int PersonalUnforwardedDays { get; init; } = DefaultPersonalDays;
 
-    /// <summary>Lifetime of forwarded (F) bulletins, days.</summary>
-    public int BulletinForwardedDays { get; init; } = 30;
+    /// <summary>Lifetime of forwarded (F) bulletins, days. Defaults to <see cref="DefaultBulletinDays"/> (~a week).</summary>
+    public int BulletinForwardedDays { get; init; } = DefaultBulletinDays;
 
-    /// <summary>Lifetime of unforwarded bulletins (N, Y or $), days.</summary>
-    public int BulletinUnforwardedDays { get; init; } = 30;
+    /// <summary>Lifetime of unforwarded bulletins (N, Y or $), days. Defaults to <see cref="DefaultBulletinDays"/> (~a week).</summary>
+    public int BulletinUnforwardedDays { get; init; } = DefaultBulletinDays;
 
     /// <summary>Lifetime of delivered (D) NTS messages, days.</summary>
-    public int NtsDeliveredDays { get; init; } = 30;
+    public int NtsDeliveredDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>Lifetime of forwarded (F) NTS messages, days.</summary>
-    public int NtsForwardedDays { get; init; } = 30;
+    public int NtsForwardedDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>Lifetime of unforwarded (N or Y) NTS messages, days.</summary>
-    public int NtsUnforwardedDays { get; init; } = 30;
+    public int NtsUnforwardedDays { get; init; } = DefaultPersonalDays;
 
     /// <summary>BID dedup-record lifetime, days (compat spec §2.3/§6 "BID Lifetime default 60").</summary>
     public int BidLifetimeDays { get; init; } = 60;
@@ -45,13 +64,31 @@ public sealed record HousekeepingPolicy
     /// behaviour ("remains on disk until housekeeping removes it", compat spec §2.2/§6).
     /// </summary>
     public int KilledPurgeGraceDays { get; init; }
+
+    /// <summary>
+    /// The message-number ceiling (BPQ <c>MaxMsgno</c>, compat spec §6). <b>0 disables renumbering</b>
+    /// — the default, so an upgraded node behaves exactly as before until the operator opts in. When
+    /// positive, a housekeeping run whose highest live message number is at or above this value
+    /// triggers a compacting renumber AFTER the kill/purge passes: the surviving messages are
+    /// renumbered densely from 1 (oldest → newest) so the next allocated number is well below the
+    /// ceiling again. The renumber preserves referential integrity — the network-wide BID
+    /// (<c>&lt;msgno&gt;_&lt;BBSCALL&gt;</c>, a frozen network identity) is NEVER rewritten; only the
+    /// local message <c>number</c> and every local row that references it are remapped atomically
+    /// (recipients, forwards, attachments, per-user read state, 7plus parts/files, the BID back-link,
+    /// and each user's last-listed marker). The ceiling interacts with kill-by-age by running second:
+    /// kill-by-age + the K-purge shrink the store first, so renumbering only ever compacts what
+    /// genuinely survives. The interval check uses <c>&gt;=</c> so a ceiling exactly at the current
+    /// high-water mark still fires.
+    /// </summary>
+    public long MaxMsgno { get; init; }
 }
 
 /// <summary>Counts from one housekeeping run, for the Host's log.</summary>
 /// <param name="KilledMessagesPurged">K messages physically deleted.</param>
 /// <param name="MessagesKilledByAge">Messages moved to K by the age matrix.</param>
 /// <param name="BidsPurged">BID dedup records dropped by lifetime.</param>
-public sealed record HousekeepingSummary(int KilledMessagesPurged, int MessagesKilledByAge, int BidsPurged);
+/// <param name="MessagesRenumbered">Live messages remapped to a new dense number by the MaxMsgno renumber pass (0 when the ceiling did not fire).</param>
+public sealed record HousekeepingSummary(int KilledMessagesPurged, int MessagesKilledByAge, int BidsPurged, int MessagesRenumbered = 0);
 
 /// <summary>
 /// The housekeeping pass (compat spec §6), invoked by the Host on a timer (daily at
@@ -63,8 +100,9 @@ public sealed record HousekeepingSummary(int KilledMessagesPurged, int MessagesK
 /// Status→lifetime mapping judgments (the spec names categories, not statuses): H messages are
 /// exempt (they sit in the sysop's queue per §2.2 and cannot expire silently); "unforwarded"
 /// personals are N with forwarding still pending, "unread" are N without; bulletins map F vs
-/// everything-else (N/Y/$). Named deferrals: per-From/To/At overrides ("ALL, 10" style),
-/// non-delivery notifications, message renumbering (§6).
+/// everything-else (N/Y/$). The MaxMsgno renumber (§6) runs LAST, after the store has been
+/// shrunk by the kill/purge passes, so it only ever compacts genuinely-surviving messages.
+/// Named deferrals: per-From/To/At overrides ("ALL, 10" style), non-delivery notifications.
 /// </summary>
 public static class Housekeeping
 {
@@ -96,7 +134,17 @@ public static class Housekeeping
         // 3. BID lifetime purge.
         int purgedBids = store.PurgeExpiredBids(now - (policy.BidLifetimeDays * SecondsPerDay));
 
-        return new HousekeepingSummary(purgedKilled, killedByAge, purgedBids);
+        // 4. MaxMsgno renumber. Runs last so it compacts only what survived 1–3. Fires when the
+        // ceiling is enabled (>0) AND the current high-water mark has reached it (>=). Renumbering
+        // densely from 1 keeps the next allocated number well below the ceiling; the BID (the network
+        // identity) is untouched, so referential integrity to partners is preserved (issue #39).
+        int renumbered = 0;
+        if (policy.MaxMsgno > 0 && store.GetLatestMessageNumber() >= policy.MaxMsgno)
+        {
+            renumbered = store.RenumberMessages();
+        }
+
+        return new HousekeepingSummary(purgedKilled, killedByAge, purgedBids, renumbered);
     }
 
     private static long Cutoff(long now, int days) => now - (days * SecondsPerDay);
