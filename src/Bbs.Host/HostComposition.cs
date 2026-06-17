@@ -139,7 +139,7 @@ public static class HostComposition
             TimeSpan.FromSeconds(Math.Max(1, config.DemuxFirstLineWaitSeconds)),
             sp.GetRequiredService<ILogger<InboundDemux>>()));
         builder.Services.AddSingleton(sp => new HousekeepingRunner(
-            store, new HousekeepingPolicy(), time, sp.GetRequiredService<ILogger<HousekeepingRunner>>()));
+            store, config.Housekeeping.ToPolicy(), time, sp.GetRequiredService<ILogger<HousekeepingRunner>>()));
         builder.Services.AddSingleton(sp => new PendingSendReleaser(
             store, sp.GetRequiredService<RoutingService>(), time, sp.GetRequiredService<ILogger<PendingSendReleaser>>()));
 

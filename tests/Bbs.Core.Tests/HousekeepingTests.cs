@@ -185,4 +185,185 @@ public sealed class HousekeepingTests : IDisposable
         Assert.True(summary.BidsPurged >= 1);
         Assert.Null(_ts.Store.LookupBid("STALE_BID"));
     }
+
+    // ---------------------------------------------------------------- issue #39: per-class defaults
+
+    [Fact]
+    public void Default_Bulletins_AgeOutAtSevenDays_PersonalsAtThirty()
+    {
+        // The headline per-class default change (issue #39): with the BUILT-IN policy a bulletin
+        // ages out at ~a week while a personal still lives a month.
+        Message bull = _ts.Store.AddMessage(Drafts.Bulletin(subject: "weekly news"));
+        Message personal = _ts.Store.AddMessage(Drafts.Personal(subject: "keep me a month"));
+
+        // Day 8: the bulletin is past its 7-day default; the personal is nowhere near its 30.
+        _ts.Time.AdvanceDays(8);
+        Assert.Equal(1, Housekeeping.Run(_ts.Store, Defaults).MessagesKilledByAge);
+        Assert.Equal(MessageStatus.Killed, _ts.Store.GetMessage(bull.Number)!.Status);
+        Assert.Equal(MessageStatus.Unread, _ts.Store.GetMessage(personal.Number)!.Status);
+
+        // Day 31 total: now the personal is past 30 too.
+        _ts.Time.AdvanceDays(23);
+        Assert.Equal(1, Housekeeping.Run(_ts.Store, Defaults).MessagesKilledByAge);
+        Assert.Equal(MessageStatus.Killed, _ts.Store.GetMessage(personal.Number)!.Status);
+    }
+
+    [Fact]
+    public void DefaultPolicy_ExposesTheDocumentedClassConstants()
+    {
+        Assert.Equal(7, HousekeepingPolicy.DefaultBulletinDays);
+        Assert.Equal(30, HousekeepingPolicy.DefaultPersonalDays);
+        var defaults = new HousekeepingPolicy();
+        Assert.Equal(7, defaults.BulletinForwardedDays);
+        Assert.Equal(7, defaults.BulletinUnforwardedDays);
+        Assert.Equal(30, defaults.PersonalReadDays);
+        Assert.Equal(30, defaults.NtsUnforwardedDays);
+        Assert.Equal(0, defaults.MaxMsgno); // renumbering off unless opted in
+    }
+
+    // ---------------------------------------------------------------- issue #39: MaxMsgno renumber
+
+    [Fact]
+    public void MaxMsgno_Zero_NeverRenumbers()
+    {
+        Message a = _ts.Store.AddMessage(Drafts.Personal(subject: "a"));
+        Message b = _ts.Store.AddMessage(Drafts.Personal(subject: "b"));
+        // The default policy has MaxMsgno=0: even a tiny high-water mark must not renumber.
+        HousekeepingSummary summary = Housekeeping.Run(_ts.Store, Defaults);
+        Assert.Equal(0, summary.MessagesRenumbered);
+        Assert.NotNull(_ts.Store.GetMessage(a.Number));
+        Assert.NotNull(_ts.Store.GetMessage(b.Number));
+    }
+
+    [Fact]
+    public void MaxMsgno_BelowCeiling_DoesNotRenumber()
+    {
+        _ts.Store.AddMessage(Drafts.Personal(subject: "a"));
+        _ts.Store.AddMessage(Drafts.Personal(subject: "b")); // high-water mark = 2
+        var policy = new HousekeepingPolicy { MaxMsgno = 100, BulletinForwardedDays = 1000, PersonalReadDays = 1000 };
+        Assert.Equal(0, Housekeeping.Run(_ts.Store, policy).MessagesRenumbered);
+    }
+
+    [Fact]
+    public void MaxMsgno_AtCeiling_CompactsSurvivorsFromOne_AndBidsAreStable()
+    {
+        // Three messages (numbers 1,2,3). Kill+purge #2, then trip the ceiling: the survivors compact
+        // to 1,2 (old 1 stays 1; old 3 becomes 2). The wire identity (BID) must NOT move.
+        Message m1 = _ts.Store.AddMessage(Drafts.Personal(subject: "one"));
+        Message m2 = _ts.Store.AddMessage(Drafts.Personal(subject: "two"));
+        Message m3 = _ts.Store.AddMessage(Drafts.Personal(subject: "three"));
+        string bid1 = m1.Bid, bid3 = m3.Bid;
+
+        _ts.Store.Kill(m2.Number); // purged on the next run (grace 0)
+
+        var policy = new HousekeepingPolicy
+        {
+            MaxMsgno = 3, // high-water mark is exactly 3 → fires (>=)
+            PersonalReadDays = 1000, PersonalUnreadDays = 1000, // keep the survivors alive
+        };
+
+        HousekeepingSummary summary = Housekeeping.Run(_ts.Store, policy);
+
+        Assert.Equal(1, summary.KilledMessagesPurged); // #2 gone
+        Assert.Equal(1, summary.MessagesRenumbered);   // only old#3→new#2 actually moves (old#1 stays #1)
+        // Survivors are dense 1..2; the BIDs are unchanged and now point at the NEW numbers.
+        Assert.Equal("one", _ts.Store.GetMessage(1)!.Subject);
+        Assert.Equal("three", _ts.Store.GetMessage(2)!.Subject);
+        Assert.Null(_ts.Store.GetMessage(3));
+        Assert.Equal(1, _ts.Store.LookupBid(bid1)!.MessageNumber);
+        Assert.Equal(2, _ts.Store.LookupBid(bid3)!.MessageNumber);
+
+        // A NEW message after the renumber continues from the dense max, never reissuing a number.
+        Message m4 = _ts.Store.AddMessage(Drafts.Personal(subject: "four"));
+        Assert.Equal(3, m4.Number);
+    }
+
+    [Fact]
+    public void MaxMsgno_Renumber_PreservesRecipientForwardAndReadReferences()
+    {
+        // Referential-integrity proof: recipients, the forward queue, per-recipient read-state and a
+        // per-user (bulletin) read marker all follow their message across a renumber.
+        Message gap = _ts.Store.AddMessage(Drafts.Personal(subject: "gap")); // becomes the purged hole
+        Message keep = _ts.Store.AddMessage(Drafts.Personal(to: "G8BPQ", subject: "keep"));
+        Message bull = _ts.Store.AddMessage(Drafts.Bulletin(subject: "bull"));
+        string keepBid = keep.Bid, bullBid = bull.Bid;
+
+        _ts.Store.MarkRead(keep.Number, "G8BPQ");               // recipient read-state
+        _ts.Store.EnqueueForwards(keep.Number, ["GB7XYZ"]);     // a pending forward
+        _ts.Store.SetReadByUser("M0ABC", bull.Number);          // per-user bulletin read marker
+
+        _ts.Store.Kill(gap.Number);
+
+        var policy = new HousekeepingPolicy
+        {
+            MaxMsgno = 3,
+            PersonalReadDays = 1000, PersonalUnreadDays = 1000, PersonalForwardedDays = 1000,
+            BulletinForwardedDays = 1000, BulletinUnforwardedDays = 1000,
+        };
+        Assert.Equal(2, Housekeeping.Run(_ts.Store, policy).MessagesRenumbered);
+
+        long newKeep = _ts.Store.LookupBid(keepBid)!.MessageNumber!.Value;
+        long newBull = _ts.Store.LookupBid(bullBid)!.MessageNumber!.Value;
+        Assert.Equal(1, newKeep); // gap was #1; keep was #2 → compacts to #1
+        Assert.Equal(2, newBull);
+
+        // The recipient row + its read-state moved with the message.
+        Message keepNow = _ts.Store.GetMessage(newKeep)!;
+        Assert.Equal("G8BPQ", Assert.Single(keepNow.Recipients).ToCall);
+        Assert.NotNull(Assert.Single(keepNow.Recipients).ReadAt);
+
+        // The pending forward moved with the message — still queued for GB7XYZ at the NEW number.
+        Assert.Contains(_ts.Store.GetForwardQueue("GB7XYZ"), m => m.Number == newKeep);
+        Assert.Equal("GB7XYZ", Assert.Single(_ts.Store.GetMessageForwards(newKeep)).PartnerCall);
+
+        // The per-user bulletin read marker moved with the bulletin.
+        Assert.True(_ts.Store.IsReadByUser("M0ABC", newBull));
+        Assert.False(_ts.Store.IsReadByUser("M0ABC", 99));
+    }
+
+    [Fact]
+    public void MaxMsgno_Renumber_RemapsLastListedWatermark()
+    {
+        // A user who had listed up to #3 must still see "everything up to here is seen" after a
+        // renumber compacts the numbers. #2 is the purged hole; survivors 1,3 → 1,2.
+        _ts.Store.AddMessage(Drafts.Personal(subject: "one"));
+        Message two = _ts.Store.AddMessage(Drafts.Personal(subject: "two"));
+        _ts.Store.AddMessage(Drafts.Personal(subject: "three"));
+        _ts.Store.SetLastListed("M0LTE", 3);
+
+        _ts.Store.Kill(two.Number);
+
+        var policy = new HousekeepingPolicy { MaxMsgno = 3, PersonalReadDays = 1000, PersonalUnreadDays = 1000 };
+        Housekeeping.Run(_ts.Store, policy);
+
+        // The watermark maps to the new number of the highest survivor at/below the old watermark (#3 → new #2).
+        Assert.Equal(2, _ts.Store.GetUser("M0LTE")!.LastListedNumber);
+    }
+
+    [Fact]
+    public void MaxMsgno_Renumber_SurvivesReopen()
+    {
+        // Crash-safety surrogate: the renumber commits, then we reopen the db on the same file —
+        // the commit is the atomic boundary, so the new numbering must be durable. A purged hole
+        // (#2) forces real movement (old#4→#3) so this exercises a true renumber, not a no-op.
+        Message a = _ts.Store.AddMessage(Drafts.Personal(subject: "a"));   // #1
+        Message gap = _ts.Store.AddMessage(Drafts.Personal(subject: "gap")); // #2 (purged)
+        _ts.Store.AddMessage(Drafts.Personal(subject: "c"));               // #3
+        Message d = _ts.Store.AddMessage(Drafts.Personal(subject: "d"));   // #4
+        string aBid = a.Bid, dBid = d.Bid;
+        _ts.Store.Kill(gap.Number);
+
+        var policy = new HousekeepingPolicy { MaxMsgno = 4, PersonalReadDays = 1000, PersonalUnreadDays = 1000 };
+        Assert.Equal(2, Housekeeping.Run(_ts.Store, policy).MessagesRenumbered); // old#3→#2 and old#4→#3 move
+
+        BbsStore reopened = _ts.Reopen();
+        // Dense 1,2,3 preserved; BIDs still resolve; next number continues from the max.
+        Assert.Equal("a", reopened.GetMessage(1)!.Subject);
+        Assert.Equal("c", reopened.GetMessage(2)!.Subject);
+        Assert.Equal("d", reopened.GetMessage(3)!.Subject);
+        Assert.Equal(1, reopened.LookupBid(aBid)!.MessageNumber);
+        Assert.Equal(3, reopened.LookupBid(dBid)!.MessageNumber);
+        Message e = reopened.AddMessage(Drafts.Personal(subject: "e"));
+        Assert.Equal(4, e.Number);
+    }
 }

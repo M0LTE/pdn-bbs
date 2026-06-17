@@ -1689,6 +1689,147 @@ public sealed class BbsStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// The MaxMsgno compacting renumber (BPQ <c>MaxMsgno</c>, compat spec §6 / issue #39). Renumbers
+    /// every live message densely from 1 in ascending old-number order (so chronological order is
+    /// preserved), remapping every local row that references a message number, and resets the
+    /// AUTOINCREMENT high-water mark so subsequently-allocated numbers continue from the new dense
+    /// maximum. Returns the count of messages renumbered (rows whose number actually changed), or 0
+    /// when the store is already dense (no row would move).
+    ///
+    /// <para><b>Referential integrity.</b> The network-wide BID (<c>&lt;msgno&gt;_&lt;BBSCALL&gt;</c>) is a
+    /// frozen network identity and is NEVER rewritten — partners track it on the wire, in R: lines and
+    /// in their own dedup stores, so renumbering a local sequence must not change it. Only the LOCAL
+    /// <c>messages.number</c> and the rows keyed on it move: <c>recipients</c>, <c>forwards</c>,
+    /// <c>attachments</c>, <c>message_read</c>, <c>sevenplus_parts.source_message_number</c>,
+    /// <c>sevenplus_files.assembled_message_number</c>, the <c>bids.message_number</c> live-copy
+    /// back-link, and each user's <c>last_listed_number</c> watermark (mapped to the new number of the
+    /// highest surviving message at or below the old watermark, so "already seen" survives). The whole
+    /// remap runs in ONE transaction with foreign-key checks deferred to COMMIT, so a crash mid-run
+    /// rolls back to the pre-renumber state — the commit is the atomic boundary.</para>
+    /// </summary>
+    internal int RenumberMessages()
+    {
+        lock (_gate)
+        {
+            using SqliteTransaction tx = _connection.BeginTransaction();
+
+            // Defer FK enforcement to COMMIT: we rewrite parents (messages.number) and children in the
+            // same transaction, so a row will transiently reference a not-yet-moved parent. The check
+            // at COMMIT proves the final graph is consistent; a crash before COMMIT rolls everything back.
+            ExecuteRaw(_connection, tx, "PRAGMA defer_foreign_keys=ON;");
+
+            // The dense old→new map: ascending old number → 1-based rank. ROW_NUMBER over the live set
+            // (a killed-but-not-yet-purged 'K' message is still live until the K-purge deletes it, so it
+            // keeps a number and is renumbered too).
+            ExecuteRaw(_connection, tx,
+                "CREATE TEMP TABLE _renumber AS " +
+                "SELECT number AS old_number, ROW_NUMBER() OVER (ORDER BY number) AS new_number FROM messages;");
+
+            int moved;
+            using (SqliteCommand count = Command(tx,
+                "SELECT COUNT(*) FROM _renumber WHERE old_number<>new_number;"))
+            {
+                moved = Convert.ToInt32(count.ExecuteScalar()!, CultureInfo.InvariantCulture);
+            }
+
+            if (moved == 0)
+            {
+                // Already dense — nothing to do; still reset the sequence so it tracks the true max.
+                ExecuteRaw(_connection, tx, "DROP TABLE _renumber;");
+                ResetMessageSequence(tx);
+                tx.Commit();
+                return 0;
+            }
+
+            // Each user's last-listed watermark → the new number of the highest live message whose OLD
+            // number is at or below the user's old watermark (preserving "everything up to here is seen").
+            // Computed BEFORE the messages move (it reads old numbers); applied after.
+            ExecuteRaw(_connection, tx,
+                "CREATE TEMP TABLE _watermark AS " +
+                "SELECT u.callsign AS callsign, " +
+                "COALESCE((SELECT MAX(r.new_number) FROM _renumber r WHERE r.old_number<=u.last_listed_number),0) AS new_listed " +
+                "FROM users u WHERE u.last_listed_number>0;");
+
+            // Remap the message parent first, then every child reference, then the non-FK back-links.
+            // Order does not matter for correctness (FK deferred), but parents-first keeps it readable.
+            ExecuteRaw(_connection, tx,
+                "UPDATE messages SET number=(SELECT new_number FROM _renumber WHERE old_number=messages.number);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE recipients SET message_number=(SELECT new_number FROM _renumber WHERE old_number=recipients.message_number);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE forwards SET message_number=(SELECT new_number FROM _renumber WHERE old_number=forwards.message_number);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE attachments SET message_number=(SELECT new_number FROM _renumber WHERE old_number=attachments.message_number);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE message_read SET message_number=(SELECT new_number FROM _renumber WHERE old_number=message_read.message_number);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE sevenplus_parts SET source_message_number=(SELECT new_number FROM _renumber WHERE old_number=sevenplus_parts.source_message_number);");
+            // sevenplus_files.assembled_message_number + bids.message_number are nullable, non-FK
+            // back-links; remap only the rows that actually point at a renumbered message (leave NULLs
+            // and any dangling number — e.g. a bids back-link to a since-purged message — untouched).
+            ExecuteRaw(_connection, tx,
+                "UPDATE sevenplus_files SET assembled_message_number=(SELECT new_number FROM _renumber WHERE old_number=sevenplus_files.assembled_message_number) " +
+                "WHERE assembled_message_number IN (SELECT old_number FROM _renumber);");
+            ExecuteRaw(_connection, tx,
+                "UPDATE bids SET message_number=(SELECT new_number FROM _renumber WHERE old_number=bids.message_number) " +
+                "WHERE message_number IN (SELECT old_number FROM _renumber);");
+
+            // Apply the precomputed watermarks.
+            ExecuteRaw(_connection, tx,
+                "UPDATE users SET last_listed_number=(SELECT new_listed FROM _watermark WHERE _watermark.callsign=users.callsign) " +
+                "WHERE callsign IN (SELECT callsign FROM _watermark);");
+
+            ExecuteRaw(_connection, tx, "DROP TABLE _watermark;");
+            ExecuteRaw(_connection, tx, "DROP TABLE _renumber;");
+
+            // The next AUTOINCREMENT must continue ABOVE the new dense max, never reissuing a number.
+            ResetMessageSequence(tx);
+
+            tx.Commit();
+            return moved;
+        }
+    }
+
+    /// <summary>
+    /// Resets the AUTOINCREMENT sequence for <c>messages</c> to the current MAX(number) so the next
+    /// inserted message gets MAX+1. SQLite's AUTOINCREMENT reads <c>sqlite_sequence</c>; after a
+    /// renumber that compacts the high-water mark down we MUST lower it too, otherwise new messages
+    /// keep the pre-renumber numbering and the ceiling is never actually relieved.
+    /// </summary>
+    private static void ResetMessageSequence(SqliteTransaction tx)
+    {
+        SqliteConnection connection = tx.Connection!;
+        long max;
+        using (SqliteCommand m = connection.CreateCommand())
+        {
+            m.Transaction = tx;
+            m.CommandText = "SELECT COALESCE(MAX(number),0) FROM messages;";
+            max = (long)m.ExecuteScalar()!;
+        }
+
+        // sqlite_sequence is a SQLite system table with NO declared PRIMARY KEY/UNIQUE constraint, so
+        // ON CONFLICT can't target it. It has a row for `messages` once the AUTOINCREMENT table has
+        // had any insert; UPDATE that row, and INSERT only when it is somehow absent (a never-inserted
+        // / empty store — harmless to seed it at the current max, which is 0).
+        using (SqliteCommand update = connection.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText = "UPDATE sqlite_sequence SET seq=$max WHERE name='messages';";
+            update.Parameters.AddWithValue("$max", max);
+            if (update.ExecuteNonQuery() > 0)
+            {
+                return;
+            }
+        }
+
+        using SqliteCommand insert = connection.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = "INSERT INTO sqlite_sequence(name,seq) VALUES('messages',$max);";
+        insert.Parameters.AddWithValue("$max", max);
+        insert.ExecuteNonQuery();
+    }
+
     internal long NowSeconds() => _time.GetUtcNow().ToUnixTimeSeconds();
 
     // ---------------------------------------------------------------- plumbing
@@ -1718,6 +1859,14 @@ public sealed class BbsStore : IDisposable
     private static void ExecuteRaw(SqliteConnection connection, string sql)
     {
         using var cmd = connection.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void ExecuteRaw(SqliteConnection connection, SqliteTransaction? tx, string sql)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = sql;
         cmd.ExecuteNonQuery();
     }

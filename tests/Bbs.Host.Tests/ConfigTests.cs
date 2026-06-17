@@ -500,4 +500,105 @@ public sealed class ConfigTests : IDisposable
         BbsHostConfig parsed = BbsHostConfigFile.Parse("callsign: GB7PDN\nserviceCallsign: \"\"");
         Assert.Equal("", parsed.ServiceCallsign);
     }
+
+    // ----- issue #39: housekeeping lifetime overrides + MaxMsgno, config-driven (no code change). -----
+
+    [Fact]
+    public void Housekeeping_AbsentBlock_KeepsBuiltInDefaults()
+    {
+        // No housekeeping: block at all → the built-in policy (bulletins 7, personals 30, no renumber).
+        BbsHostConfig parsed = BbsHostConfigFile.Parse("callsign: GB7PDN");
+        HousekeepingPolicy policy = parsed.Housekeeping.ToPolicy();
+
+        Assert.Equal(HousekeepingPolicy.DefaultBulletinDays, policy.BulletinForwardedDays);
+        Assert.Equal(HousekeepingPolicy.DefaultBulletinDays, policy.BulletinUnforwardedDays);
+        Assert.Equal(HousekeepingPolicy.DefaultPersonalDays, policy.PersonalReadDays);
+        Assert.Equal(HousekeepingPolicy.DefaultPersonalDays, policy.NtsForwardedDays);
+        Assert.Equal(60, policy.BidLifetimeDays);
+        Assert.Equal(0, policy.KilledPurgeGraceDays);
+        Assert.Equal(0, policy.MaxMsgno); // renumbering off by default
+    }
+
+    [Fact]
+    public void Housekeeping_PartialOverride_OnlyChangesNamedKeys()
+    {
+        // An operator sets just two keys; everything unset keeps its built-in default.
+        BbsHostConfig parsed = BbsHostConfigFile.Parse("""
+            callsign: GB7PDN
+            housekeeping:
+              bulletinForwardedDays: 3
+              bulletinUnforwardedDays: 3
+              maxMsgno: 9000000
+            """);
+        HousekeepingPolicy policy = parsed.Housekeeping.ToPolicy();
+
+        Assert.Equal(3, policy.BulletinForwardedDays);
+        Assert.Equal(3, policy.BulletinUnforwardedDays);
+        Assert.Equal(9_000_000, policy.MaxMsgno);
+        // Untouched keys keep the built-in defaults.
+        Assert.Equal(HousekeepingPolicy.DefaultPersonalDays, policy.PersonalReadDays);
+        Assert.Equal(60, policy.BidLifetimeDays);
+    }
+
+    [Fact]
+    public void Housekeeping_FullOverride_RoundTripsEveryKey()
+    {
+        BbsHostConfig parsed = BbsHostConfigFile.Parse("""
+            callsign: GB7PDN
+            housekeeping:
+              personalReadDays: 11
+              personalUnreadDays: 12
+              personalForwardedDays: 13
+              personalUnforwardedDays: 14
+              bulletinForwardedDays: 5
+              bulletinUnforwardedDays: 6
+              ntsDeliveredDays: 21
+              ntsForwardedDays: 22
+              ntsUnforwardedDays: 23
+              bidLifetimeDays: 90
+              killedPurgeGraceDays: 2
+              maxMsgno: 50000
+            """);
+        HousekeepingPolicy p = parsed.Housekeeping.ToPolicy();
+
+        Assert.Equal(11, p.PersonalReadDays);
+        Assert.Equal(12, p.PersonalUnreadDays);
+        Assert.Equal(13, p.PersonalForwardedDays);
+        Assert.Equal(14, p.PersonalUnforwardedDays);
+        Assert.Equal(5, p.BulletinForwardedDays);
+        Assert.Equal(6, p.BulletinUnforwardedDays);
+        Assert.Equal(21, p.NtsDeliveredDays);
+        Assert.Equal(22, p.NtsForwardedDays);
+        Assert.Equal(23, p.NtsUnforwardedDays);
+        Assert.Equal(90, p.BidLifetimeDays);
+        Assert.Equal(2, p.KilledPurgeGraceDays);
+        Assert.Equal(50_000, p.MaxMsgno);
+    }
+
+    [Fact]
+    public void Housekeeping_NegativeOrZeroMaxMsgno_DisablesRenumber_NegativeLifetimeKeepsDefault()
+    {
+        BbsHostConfig parsed = BbsHostConfigFile.Parse("""
+            callsign: GB7PDN
+            housekeeping:
+              maxMsgno: 0
+              personalReadDays: -5
+            """);
+        HousekeepingPolicy p = parsed.Housekeeping.ToPolicy();
+        Assert.Equal(0, p.MaxMsgno); // 0 keeps renumber disabled
+        Assert.Equal(HousekeepingPolicy.DefaultPersonalDays, p.PersonalReadDays); // negative clamped to default
+    }
+
+    [Fact]
+    public void Housekeeping_DefaultYaml_ParsesToBuiltInDefaults()
+    {
+        // The commented default file documents housekeeping but leaves the block off ⇒ built-in policy.
+        foreach (string yaml in new[] { BbsHostConfigFile.DefaultYaml, BbsHostConfigFile.PdnDefaultYaml })
+        {
+            HousekeepingPolicy p = BbsHostConfigFile.Parse(yaml).Housekeeping.ToPolicy();
+            Assert.Equal(HousekeepingPolicy.DefaultBulletinDays, p.BulletinForwardedDays);
+            Assert.Equal(HousekeepingPolicy.DefaultPersonalDays, p.PersonalReadDays);
+            Assert.Equal(0, p.MaxMsgno);
+        }
+    }
 }
