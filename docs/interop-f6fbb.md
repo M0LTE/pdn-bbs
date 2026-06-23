@@ -61,3 +61,31 @@ build inputs) so only the first run pays the full `make all`.
 
 Runner prerequisites (self-hosted): `/dev/kvm` (falls back to slow TCG), passwordless `sudo` for the
 `f6fbbr0` bridge + tap, and the `make all` build deps.
+
+## Status (2026-06-23)
+
+**Landed and verified.** The outbound lane (pdn-bbs caller → real xfbbd) is exercised against a live
+rig: the production `FbbSessionRunner` drives a full B1F forwarding cycle into canonical F6FBB 7.0.11
+over AXUDP, asserting on both the captured wire and the pdn-bbs store outcome.
+
+- **Verified end-to-end** against a booted rig on the current `Packet.* 0.16.0` pins:
+  **7 passed / 1 skipped, 0 failed**.
+- **Covered:** transport smoke (FBB SID), single-message PoC, empty-queue FF/FQ, three-in-one-block,
+  oversize-hold, B2-offered-but-peer-is-B1-only (negative gate against silent B2 mis-activation), and
+  duplicate-BID refuse/dedup.
+- **Observability:** `FbbSessionRunner` logs the live B1F/B2F wire at `Debug` (every protocol line out,
+  inbound chunk, and transfer-block size).
+- **No pdn-bbs bugs found** by this lane to date — it has matched canonical FBB byte-for-byte. Its
+  value is divergence-catching against the *original* Jean-Paul Roubelat FBB code, complementing the
+  LinBPQ oracle (a reimplementation).
+
+**Parked.** The inbound direction (real xfbbd dials pdn-bbs, exercising the self-greeting answerer) is
+present as `F6fbbInboundTests` but `[Fact(Skip = …)]`: canonical F6FBB's forward scheduler does not fire
+the autonomous dial over the ax25ipd/kernel-AX.25 port despite a full `forward.sys` partner + `bbs.sys`
+slot + `R` (force-dial) config. The raw AX.25 outbound path itself works (proven with `ax25_call`); the
+block is isolated to FBB's scheduler. The `selfGreet` answerer + this test pass the instant xfbbd dials —
+next step is FBB `DEBUG`/strace instrumentation or a sysop force-forward on the rig.
+
+**Known follow-up.** The LinBPQ oracle lane still drives a hand-maintained `Ax25FbbSessionRunner`
+transcription rather than the production `FbbSessionRunner`; migrating those tests onto the real runner
+(and deleting the transcription) is tracked separately and gated on the oracle stack being up.
