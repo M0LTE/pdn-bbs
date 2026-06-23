@@ -9,6 +9,13 @@
   <ItemGroup>
     <PackageReference Include="Konscious.Security.Cryptography.Argon2" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
+    <!-- CVE-2025-6965 (NU1903): Microsoft.Data.Sqlite 10.0.x still pins the vulnerable native SQLite
+         (SQLitePCLRaw.lib.e_sqlite3 2.1.11 = SQLite < 3.50.2). Override just the native lib to 3.50.3
+         (= SQLite 3.50.3, patched). lib.e_sqlite3 is native-runtime-assets only, so the managed
+         core/provider 2.1.11 stay matched to Microsoft.Data.Sqlite — no managed API change. This
+         direct ref propagates the bump to every project that references Bbs.Core. Drop it once
+         Microsoft.Data.Sqlite ships a SQLitePCLRaw bump past the advisory. -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
   </ItemGroup>
 
 </Project>

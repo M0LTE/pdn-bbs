@@ -13,6 +13,8 @@
     <PackageVersion Include="Packet.Ax25" Version="0.16.0" />
     <PackageVersion Include="Packet.Kiss" Version="0.16.0" />
     <PackageVersion Include="RhpV2.Client" Version="0.3.1" />
+    <!-- CVE-2025-6965: override only the native SQLite binary. See Bbs.Core.csproj. -->
+    <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.50.3" />
     <PackageVersion Include="YamlDotNet" Version="16.3.0" />
     <PackageVersion Include="xunit" Version="2.9.2" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
