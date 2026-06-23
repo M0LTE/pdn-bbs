@@ -75,11 +75,21 @@ public sealed class FbbSessionRunner
     /// so nothing is lost. A configured partner contributes its queue for reverse forwarding
     /// (spec §3.11) and its size caps; an unknown SID-shaped caller is still served with
     /// defaults (messages stored with its callsign as ReceivedFrom).
+    /// <para>
+    /// <paramref name="selfGreet"/> is for a demux-less leg — a raw AX.25 / AXUDP / direct-FBB
+    /// link with no <see cref="Sessions.InboundDemux"/> ahead of it (the interop harness and the
+    /// answer-real-xfbbd direction). When true the runner does NOT assume an upstream greet: the
+    /// FSM emits our SID + <c>de CALL&gt;</c> prompt itself on start (symmetric with the
+    /// self-greeting caller), and <paramref name="initialData"/> is normally empty (nothing was
+    /// peeked). The default (false) keeps continue-mode: the demux already greeted and handed us
+    /// the peeked SID line — the production node / FBBPORT path, unchanged.
+    /// </para>
     /// </summary>
     public Task<FbbSessionResult> RunAnswererAsync(
         IFbbConnection child,
         byte[] initialData,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool selfGreet = false)
     {
         ArgumentNullException.ThrowIfNull(child);
         ArgumentNullException.ThrowIfNull(initialData);
@@ -95,7 +105,7 @@ public sealed class FbbSessionRunner
                 // doesn't re-skip them forever — see ForwardingScheduler / compat spec §4.1.
                 onOversize: (number, bytes) => _store.HoldMessage(number,
                     FormattableString.Invariant($"too large for {partner.Call} ({bytes} > {partner.MaxTxSize} bytes)")));
-        return RunAsync(FbbRole.Answerer, child, partner, partnerCall, outbound, initialData, cancellationToken);
+        return RunAsync(FbbRole.Answerer, child, partner, partnerCall, outbound, initialData, selfGreet, cancellationToken);
     }
 
     /// <summary>
@@ -113,7 +123,7 @@ public sealed class FbbSessionRunner
         ArgumentNullException.ThrowIfNull(child);
         ArgumentNullException.ThrowIfNull(partner);
         ArgumentNullException.ThrowIfNull(outbound);
-        return RunAsync(FbbRole.Caller, child, partner, partner.Call, outbound, initialData, cancellationToken);
+        return RunAsync(FbbRole.Caller, child, partner, partner.Call, outbound, initialData, selfGreet: false, cancellationToken);
     }
 
     private async Task<FbbSessionResult> RunAsync(
@@ -123,6 +133,7 @@ public sealed class FbbSessionRunner
         string partnerCall,
         IReadOnlyList<OutboundItem> outbound,
         byte[]? initialData,
+        bool selfGreet,
         CancellationToken cancellationToken)
     {
         var session = new FbbSession(
@@ -132,8 +143,10 @@ public sealed class FbbSessionRunner
                 OwnCallsign = _identity.Callsign,
                 SidVersion = _sidVersion,
 
-                // Answerer = continue-mode: the demux greeted (SID + prompt) on accept.
-                SidAlreadySent = role == FbbRole.Answerer,
+                // Answerer = continue-mode by default: the demux greeted (SID + prompt) on
+                // accept. selfGreet flips this for a demux-less leg (raw AX.25 / AXUDP / FBB):
+                // the FSM emits our SID + prompt itself on FbbStart, symmetric with the caller.
+                SidAlreadySent = role == FbbRole.Answerer && !selfGreet,
 
                 // B2F is opt-in per partner (default off → B1 unchanged). When set we advertise
                 // '2' in our SID; the session then activates B2 only if the peer's SID also
@@ -165,6 +178,11 @@ public sealed class FbbSessionRunner
         LogNegotiatedOnce(session, state);
         if (initialData is { Length: > 0 })
         {
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                LogWireRx(_logger, partnerCall, Readable(initialData, RxLogCap), null);
+            }
+
             await ApplyAsync(session.Advance(new FbbPeerData(initialData)), session, child, state, cancellationToken)
                 .ConfigureAwait(false);
             LogNegotiatedOnce(session, state);
@@ -191,6 +209,11 @@ public sealed class FbbSessionRunner
             {
                 LogDropped(_logger, partnerCall, null);
                 return new FbbSessionResult(Completed: false, Graceful: false);
+            }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                LogWireRx(_logger, partnerCall, Readable(data, RxLogCap), null);
             }
 
             await ApplyAsync(session.Advance(new FbbPeerData(data)), session, child, state, cancellationToken)
@@ -234,12 +257,14 @@ public sealed class FbbSessionRunner
             {
                 case FbbSendLine line:
                     // "the transport MUST append CRLF" (FbbSendLine contract, spec §3.13.2).
+                    LogWireTx(_logger, state.PartnerCall, line.Line, null);
                     await SendToleratingCloseAsync(
                         child, session, state, Encoding.Latin1.GetBytes(line.Line + "\r\n"), cancellationToken)
                         .ConfigureAwait(false);
                     break;
 
                 case FbbSendBytes bytes:
+                    LogWireTxBin(_logger, state.PartnerCall, bytes.Data.Length, null);
                     await SendToleratingCloseAsync(child, session, state, bytes.Data, cancellationToken)
                         .ConfigureAwait(false);
                     break;
@@ -378,4 +403,59 @@ public sealed class FbbSessionRunner
     private static readonly Action<ILogger, string, string, string, Exception?> LogNegotiated =
         LoggerMessage.Define<string, string, string>(LogLevel.Information, new EventId(7, "FbbNegotiated"),
             "Forwarding session with {Partner} negotiated {Mode} (peer SID {PeerSid})");
+
+    // --- Debug-level wire observability (gated by Debug; zero-cost when not enabled) ---
+    // Renders the live B1F/B2F conversation: every protocol line out, every inbound chunk, and
+    // transfer-block sizes. Turn on Bbs.Host.Forwarding at Debug to watch a forwarding session.
+
+    /// <summary>Cap on the readable rendering of an inbound chunk so a binary transfer block does not
+    /// flood the log; protocol lines (FA/F&gt;/FS/FF/FQ/SID) are far shorter than this.</summary>
+    private const int RxLogCap = 200;
+
+    private static readonly Action<ILogger, string, string, Exception?> LogWireTx =
+        LoggerMessage.Define<string, string>(LogLevel.Debug, new EventId(8, "FbbWireTx"),
+            "FBB > {Partner}: {Line}");
+
+    private static readonly Action<ILogger, string, int, Exception?> LogWireTxBin =
+        LoggerMessage.Define<string, int>(LogLevel.Debug, new EventId(9, "FbbWireTxBin"),
+            "FBB > {Partner}: <{Bytes}-byte binary block>");
+
+    private static readonly Action<ILogger, string, string, Exception?> LogWireRx =
+        LoggerMessage.Define<string, string>(LogLevel.Debug, new EventId(10, "FbbWireRx"),
+            "FBB < {Partner}: {Data}");
+
+    /// <summary>Log-safe rendering of wire bytes: printable ASCII verbatim, CR/LF as \r/\n, any other
+    /// byte as &lt;HH&gt; hex; capped at <paramref name="cap"/> with a "+Nb" tail for the remainder.</summary>
+    private static string Readable(ReadOnlySpan<byte> bytes, int cap)
+    {
+        int n = Math.Min(bytes.Length, cap);
+        var sb = new StringBuilder(n + 12);
+        for (int i = 0; i < n; i++)
+        {
+            byte b = bytes[i];
+            if (b == 13)
+            {
+                sb.Append("\\r");
+            }
+            else if (b == 10)
+            {
+                sb.Append("\\n");
+            }
+            else if (b is >= 32 and < 127)
+            {
+                sb.Append((char)b);
+            }
+            else
+            {
+                sb.Append('<').Append(b.ToString("X2")).Append('>');
+            }
+        }
+
+        if (bytes.Length > cap)
+        {
+            sb.Append("…+").Append(bytes.Length - cap).Append('b');
+        }
+
+        return sb.ToString();
+    }
 }
