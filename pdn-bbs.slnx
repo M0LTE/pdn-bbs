@@ -15,9 +15,13 @@
     <Project Path="tests/Bbs.Fbb.Tests/Bbs.Fbb.Tests.csproj" />
     <Project Path="tests/Bbs.Host.Tests/Bbs.Host.Tests.csproj" />
     <Project Path="tests/Bbs.Imap.Tests/Bbs.Imap.Tests.csproj" />
+    <Project Path="tests/Bbs.Import.Bpq.Tests/Bbs.Import.Bpq.Tests.csproj" />
     <Project Path="tests/Bbs.Interop.Tests/Bbs.Interop.Tests.csproj" />
     <Project Path="tests/Bbs.Mime.Tests/Bbs.Mime.Tests.csproj" />
     <Project Path="tests/Bbs.SevenPlus.Tests/Bbs.SevenPlus.Tests.csproj" />
     <Project Path="tests/Bbs.Smtp.Tests/Bbs.Smtp.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Bbs.Import.Bpq/Bbs.Import.Bpq.csproj" />
   </Folder>
 </Solution>
