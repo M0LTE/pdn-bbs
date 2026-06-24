@@ -37,6 +37,16 @@ public sealed record WebmailOptions
     public Action<string>? OnForwardNow { get; init; }
 
     /// <summary>
+    /// The sysop "test connect" probe (<c>POST /forwarding/test-connect</c>): validates a partner
+    /// connection — reachability AND the real peer prompt — WITHOUT forwarding any mail. Wired in
+    /// <c>HostComposition</c> to <see cref="Bbs.Host.Forwarding.ForwardingTester.TestConnectAsync"/>
+    /// (which reuses the cycle's resolve→open→run-script→close path but runs NO FBB session and
+    /// touches NO queue). Null when no RHP link is available (a webmail-only test/standalone): the
+    /// endpoint then reports a stable <c>available:false</c> rather than 404.
+    /// </summary>
+    public Func<string, CancellationToken, Task<Bbs.Host.Forwarding.ConnectTestResult>>? TestConnect { get; init; }
+
+    /// <summary>
     /// The per-user console preferences store (the same singleton the console session uses —
     /// <c>HostComposition</c> wires the <see cref="Bbs.Host.Sessions.JsonUserSettingsStore"/>).
     /// Backs the <c>/settings</c> interface-mode toggle so a webmail flip is the same persisted
@@ -348,6 +358,22 @@ public static class Webmail
 
             IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
             return SaveYaml(options, prefix, call, form["yaml"].ToString(), embed, Theme(ctx));
+        });
+
+        // Sysop "test connect": validate a partner connection WITHOUT moving any mail (the cutover
+        // pre-flight + an ops tool). Gated exactly like the Status/Forwarding sysop page; JSON like
+        // /status.json. The probe reuses the cycle's resolve→open→run-script→close path but runs no
+        // FBB session and touches no queue (ForwardingTester), so it is incapable of moving mail.
+        app.MapPost("/forwarding/test-connect", async (HttpContext ctx) =>
+        {
+            string? call = FindCallsign(options.Store, PdnUser(ctx));
+            if (call is null)
+            {
+                return Results.Json(new { error = "no callsign" }, JsonOpts, statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
+            return await TestConnect(options, call, form["partner"].ToString(), ctx.RequestAborted).ConfigureAwait(false);
         });
 
         // ---- Observability (machine-readable) ----
@@ -832,6 +858,56 @@ public static class Webmail
             .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(kv => kv.Key, kv => kv.Value.ToString(), StringComparer.OrdinalIgnoreCase);
         return Results.Json(new { available = true, overrides }, JsonOpts);
+    }
+
+    /// <summary>
+    /// The sysop "test connect" probe (<c>POST /forwarding/test-connect</c>, sysop only — gated like the
+    /// Status/Forwarding page). Resolves the named partner, dials it, runs the connect script to the
+    /// peer SID/prompt, then closes — moving NO mail (no FBB session, no queue mutation; the
+    /// <see cref="Bbs.Host.Forwarding.ForwardingTester"/> has no path to either). Returns the observed
+    /// SID/prompt + the dialogue transcript so the operator can validate reachability AND tighten the
+    /// script's <c>EXPECT=</c> strings before un-holding forwarding at cutover. camelCase JSON.
+    /// </summary>
+    private static async Task<IResult> TestConnect(WebmailOptions o, string call, string partnerCall, CancellationToken cancellationToken)
+    {
+        if (!IsSysop(o, call))
+        {
+            return Results.Json(new { error = "sysop only" }, JsonOpts, statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        if (o.TestConnect is null)
+        {
+            // No RHP link wired (a webmail-only test/standalone): a stable contract, not a 404.
+            return Results.Json(new { available = false }, JsonOpts);
+        }
+
+        partnerCall = partnerCall.Trim();
+        if (partnerCall.Length == 0)
+        {
+            return Results.Json(new { error = "partner is required" }, JsonOpts, statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        if (o.Store.GetPartner(partnerCall) is null)
+        {
+            return Results.Json(new { error = "no such partner" }, JsonOpts, statusCode: StatusCodes.Status404NotFound);
+        }
+
+        Bbs.Host.Forwarding.ConnectTestResult result = await o.TestConnect(partnerCall, cancellationToken).ConfigureAwait(false);
+        return Results.Json(new
+        {
+            partner = result.Partner,
+            target = result.Target,
+            port = result.Port,
+            ok = result.Ok,
+            sid = result.Sid,
+            transcript = result.Transcript,
+            error = result.Error,
+            plan = new
+            {
+                steps = result.Steps,
+                warnings = result.Warnings,
+            },
+        }, JsonOpts);
     }
 
     private static IResult Bulletins(WebmailOptions o, string prefix, string call, int page, bool embed, string? theme)

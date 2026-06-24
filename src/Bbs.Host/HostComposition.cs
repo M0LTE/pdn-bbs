@@ -145,6 +145,10 @@ public static class HostComposition
         builder.Services.AddSingleton(sp => new ForwardingScheduler(
             sp.GetRequiredService<RhpNodeLink>(), sp.GetRequiredService<FbbSessionRunner>(), store, identity, time,
             sp.GetRequiredService<ILogger<ForwardingScheduler>>(), config.Forwarding.Enabled));
+        // The sysop "test connect" tool — same RHP open path as the scheduler cycle, but no FBB
+        // session and no queue (so it cannot move mail). Reuses the live link.
+        builder.Services.AddSingleton(sp => new ForwardingTester(
+            sp.GetRequiredService<RhpNodeLink>(), store, time, sp.GetRequiredService<ILogger<ForwardingTester>>()));
         builder.Services.AddSingleton<IUserSettingsStore>(
             new JsonUserSettingsStore(Path.Combine(stateDir, "user-settings.json")));
         builder.Services.AddSingleton(sp => new InboundDemux(
@@ -278,6 +282,7 @@ public static class HostComposition
         // before a restart that never reached a queue; idempotent for the rest).
         RoutingService routing = app.Services.GetRequiredService<RoutingService>();
         ForwardingScheduler scheduler = app.Services.GetRequiredService<ForwardingScheduler>();
+        ForwardingTester forwardingTester = app.Services.GetRequiredService<ForwardingTester>();
         routing.NudgePartner = scheduler.Nudge;
         routing.RouteStartupBacklog();
 
@@ -291,6 +296,8 @@ public static class HostComposition
             OnPartnersChanged = scheduler.Reconcile,
             // "Forward now" reuses the existing nudge seam (RoutingService.NudgePartner == Nudge).
             OnForwardNow = scheduler.Nudge,
+            // Sysop "test connect": validate a partner WITHOUT moving mail (no FBB session, no queue).
+            TestConnect = forwardingTester.TestConnectAsync,
             // The same per-user settings singleton the console session uses — a webmail
             // interface-mode flip is the persisted choice the next console connect reads.
             Settings = app.Services.GetRequiredService<IUserSettingsStore>(),

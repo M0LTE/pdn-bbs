@@ -61,12 +61,30 @@ public static class ConnectScriptRunner
     /// plan). Throws <see cref="ConnectScriptException"/> on failure text, an expect that
     /// never arrives, or a timed-out wait.
     /// </summary>
+    public static Task<byte[]> RunAsync(
+        RhpChildConnection child,
+        ConnectPlan plan,
+        TimeSpan responseWait,
+        TimeProvider time,
+        ILogger logger,
+        CancellationToken cancellationToken) =>
+        RunAsync(child, plan, responseWait, time, logger, transcript: null, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="RunAsync(RhpChildConnection,ConnectPlan,TimeSpan,TimeProvider,ILogger,CancellationToken)"/>,
+    /// but with the running attempt transcript exposed via <paramref name="transcript"/>: each line we
+    /// sent (<c>&gt; …</c>) and each line/match we saw (<c>&lt; …</c>) is appended as it happens. The
+    /// sysop test-connect tool passes a list so it can report the dialogue on SUCCESS too (the
+    /// production forwarding path passes null — it only needs the transcript on failure, which the
+    /// thrown <see cref="ConnectScriptException"/> already carries). Behaviour is otherwise identical.
+    /// </summary>
     public static async Task<byte[]> RunAsync(
         RhpChildConnection child,
         ConnectPlan plan,
         TimeSpan responseWait,
         TimeProvider time,
         ILogger logger,
+        List<string>? transcript,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(child);
@@ -80,7 +98,7 @@ public static class ConnectScriptRunner
         }
 
         var buffer = new ScriptLineBuffer();
-        var transcript = new List<string>();
+        transcript ??= [];
         int lastStep = plan.Steps.Count - 1;
         for (int i = 0; i < plan.Steps.Count; i++)
         {
@@ -140,6 +158,34 @@ public static class ConnectScriptRunner
         head.CopyTo(initial, 0);
         tail.CopyTo(initial, head.Length);
         return initial;
+    }
+
+    /// <summary>
+    /// Waits for the peer's SID-or-prompt line on a freshly-opened child, returning it (the same
+    /// "after the last line BPQ waits for a SID or &gt;" wait the step runner does, spec §4.4). Used
+    /// by the sysop test-connect tool for a STEPLESS plan (a bare open dialling the partner/BBS call
+    /// directly), where the runner returns no bytes — the tester still wants to surface the prompt so
+    /// the operator can tighten <c>EXPECT=</c> strings. Failure text or a timeout throws
+    /// <see cref="ConnectScriptException"/>, exactly as the step path. Read-only: it consumes inbound
+    /// bytes only; it never moves mail (no FBB session).
+    /// </summary>
+    public static async Task<string> WaitForPeerSidAsync(
+        RhpChildConnection child,
+        TimeSpan responseWait,
+        TimeProvider time,
+        ILogger logger,
+        List<string> transcript,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(child);
+        ArgumentNullException.ThrowIfNull(time);
+        ArgumentNullException.ThrowIfNull(logger);
+        ArgumentNullException.ThrowIfNull(transcript);
+
+        var buffer = new ScriptLineBuffer();
+        return await WaitForAsync(
+            child, buffer, transcript, line => Sid.IsSidShaped(line) || line.TrimEnd().EndsWith('>'),
+            "the partner SID (or prompt)", responseWait, time, logger, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

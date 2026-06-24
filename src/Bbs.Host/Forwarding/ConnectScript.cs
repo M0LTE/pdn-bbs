@@ -37,8 +37,11 @@ public sealed record ConnectPlan(
 ///
 /// <list type="bullet">
 /// <item>The FIRST step being <c>C [port] &lt;target&gt;</c> names the open (port optional,
-/// digits — extra tokens such as digipeaters are warned, no via support over RHP). No
-/// leading <c>C</c> → the open dials the partner callsign itself.</item>
+/// digits — extra tokens such as digipeaters are warned, no via support over RHP). <c>NC</c>
+/// and <c>CONNECT</c> are accepted as aliases of <c>C</c> (BPQ node-command syntax the GB7RDG
+/// migration imported verbatim). A single leading <c>!</c> on the target (BPQ's direct/no-alias
+/// flag, e.g. <c>NC 3 !GB7BPQ</c>) is stripped with a warning — RHP's open can't express it. No
+/// leading connect verb → the open dials the partner callsign itself.</item>
 /// <item>Every line AFTER the connect step is an <see cref="ExpectSendStep"/>. The
 /// <c>EXPECT=SEND</c> form (split on the FIRST <c>=</c>, whitespace trimmed around each)
 /// waits for EXPECT then sends SEND — e.g. <c>GB7RDG&gt;=BBS</c> waits for the node prompt
@@ -62,6 +65,15 @@ public static class ConnectScript
         "TIMES", "ELSE", "MSGTYPE", "INTERLOCK", "SKIPPROMPT", "SKIPCON", "TEXTFORWARDING",
         "SETCALLTOSENDER", "ATTACH", "RADIO", "FILE", "IMPORT", "RMS", "SENDWL2KFW",
     ];
+
+    /// <summary>
+    /// The connect verbs that name the RHP open's <c>[port] target</c>. <c>C</c> is the spec §4.4
+    /// form; <c>NC</c> ("node connect") and <c>CONNECT</c> are BPQ node-command aliases that the
+    /// GB7RDG migration imported verbatim (e.g. <c>NC 3 !GB7BPQ</c>). All three share the same
+    /// <c>[port] target</c> shape, so they resolve identically — only the FIRST such line is the
+    /// open; a later one is a node-level command typed at the remote prompt (a send-only step).
+    /// </summary>
+    private static readonly string[] ConnectVerbs = ["C", "NC", "CONNECT"];
 
     /// <summary>Resolves a partner's script. An empty script dials the partner callsign with no steps.</summary>
     public static ConnectPlan Resolve(Partner partner)
@@ -105,11 +117,12 @@ public static class ConnectScript
                 continue;
             }
 
-            if (verb == "C" && tokens.Length >= 2 && target is null && !sawStep && !line.Contains('='))
+            if (ConnectVerbs.Contains(verb, StringComparer.Ordinal) && tokens.Length >= 2 && target is null && !sawStep && !line.Contains('='))
             {
                 // The connect step (only valid first — an RHP open is the one node-level
                 // connect our bearer model can make). A "C …=…" line is NOT an open; it's an
-                // expect/send step whose SEND happens to be a connect command.
+                // expect/send step whose SEND happens to be a connect command. C / NC / CONNECT
+                // are aliases (BPQ node-command syntax the GB7RDG migration imported verbatim).
                 (port, target) = ParseConnectTokens(tokens, line, warnings);
                 continue;
             }
@@ -159,6 +172,18 @@ public static class ConnectScript
                 "(digipeater paths are not supported over an RHP open)");
         }
 
-        return (port, tokens[targetIndex]);
+        // BPQ's leading "!" on the target (e.g. C 3 !GB7WEM-7) is a direct/no-alias flag pinning a
+        // physical connect that bypasses the node's alias/routing table. RHP's open can't express it,
+        // so we strip it and dial the bare callsign — a named deviation, not a silent drop.
+        string target = tokens[targetIndex];
+        if (target.StartsWith('!'))
+        {
+            target = target[1..];
+            warnings.Add(
+                $"connect-script line \"{line}\": stripped the leading \"!\" from target \"{target}\" " +
+                "(BPQ's direct/no-alias flag cannot be expressed over an RHP open — dialling the bare callsign)");
+        }
+
+        return (port, target);
     }
 }
