@@ -467,7 +467,7 @@ internal static class BpqImporter
             pEnabled.Value = p.Enabled ? 1 : 0;
             pInterval.Value = Math.Max(1, p.FwdInterval);
             pNewImm.Value = p.FwdNewImmediately ? 1 : 0;
-            pScript.Value = string.Join('\n', p.ConnectScript);
+            pScript.Value = string.Join('\n', p.ConnectScript.Select(BpqConnectScript.Translate));
             pTo.Value = string.Join(' ', p.ToCalls);
             pAt.Value = string.Join(' ', p.AtCalls);
             pHr.Value = string.Join(' ', p.HRoutes);
