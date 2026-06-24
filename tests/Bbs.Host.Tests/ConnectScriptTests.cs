@@ -219,4 +219,104 @@ public class ConnectScriptTests
         Assert.Equal(("", "BBS"), Pair(Assert.Single(plan.Steps)));
         Assert.Empty(plan.Warnings);
     }
+
+    // ---- BPQ node-command syntax imported verbatim from BPQMail (GB7RDG migration) ----
+
+    [Theory]
+    [InlineData("NC GB7BPQ-1")]
+    [InlineData("nc GB7BPQ-1")]
+    [InlineData("CONNECT GB7BPQ-1")]
+    [InlineData("connect GB7BPQ-1")]
+    public void NcAndConnect_AreConnectVerbAliasesOfC(string line)
+    {
+        // BPQ "NC"/"CONNECT" name the open exactly like "C" (same [port] target shape).
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith(line));
+        Assert.Equal("GB7BPQ-1", plan.Target);
+        Assert.Null(plan.Port);
+        Assert.Empty(plan.Steps);
+        Assert.Empty(plan.Warnings);
+    }
+
+    [Fact]
+    public void NcWithPort_PinsThePortLikeC()
+    {
+        // The real imported form: NC 3 EI5IYB-1.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("NC 3 EI5IYB-1"));
+        Assert.Equal("EI5IYB-1", plan.Target);
+        Assert.Equal("3", plan.Port);
+        Assert.Empty(plan.Steps);
+        Assert.Empty(plan.Warnings);
+    }
+
+    [Fact]
+    public void NcBang_NoPort_StripsTheBangAndWarns()
+    {
+        // NC 3 !GB7BPQ -> open default-port (the "3" is the port here, so port=3), target GB7BPQ.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("NC 3 !GB7BPQ"));
+        Assert.Equal("GB7BPQ", plan.Target);
+        Assert.Equal("3", plan.Port);
+        Assert.Empty(plan.Steps);
+        string warning = Assert.Single(plan.Warnings);
+        Assert.Contains("!", warning, StringComparison.Ordinal);
+        Assert.Contains("GB7BPQ", warning, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CBang_WithPort_StripsTheBangOnTheOpen()
+    {
+        // C 3 !GB7WEM-7 -> open port 3, target GB7WEM-7, with a "!" warning.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("C 3 !GB7WEM-7"));
+        Assert.Equal("GB7WEM-7", plan.Target);
+        Assert.Equal("3", plan.Port);
+        Assert.Empty(plan.Steps);
+        Assert.Single(plan.Warnings);
+    }
+
+    [Fact]
+    public void CBang_ThenSendOnlyStep_OpensStrippedTargetAndKeepsTheRemoteStep()
+    {
+        // The split-script form: [C 3 !GB7WEM-7, C uhf gb7cip] — open GB7WEM-7 port 3, then a
+        // send-only step "C uhf gb7cip" typed at the REMOTE node ("uhf" is its port name, not ours).
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("C 3 !GB7WEM-7", "C uhf gb7cip"));
+        Assert.Equal("GB7WEM-7", plan.Target);
+        Assert.Equal("3", plan.Port);
+        Assert.Equal(("", "C uhf gb7cip"), Pair(Assert.Single(plan.Steps)));
+        Assert.Single(plan.Warnings); // the "!" strip
+    }
+
+    [Fact]
+    public void InterlockThenNcBangThenBbs_WarnsInterlock_OpensStrippedTarget_KeepsBbsStep()
+    {
+        // The real imported form: [interlock 3, NC 3 !GB7LOX-2, bbs]. INTERLOCK is recognised + warned
+        // (kept off the wire), the NC ! line names the open (target stripped + warned), and "bbs" stays
+        // a send-only step entered at the remote BBS.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("interlock 3", "NC 3 !GB7LOX-2", "bbs"));
+        Assert.Equal("GB7LOX-2", plan.Target);
+        Assert.Equal("3", plan.Port);
+        Assert.Equal(("", "bbs"), Pair(Assert.Single(plan.Steps)));
+        Assert.Equal(2, plan.Warnings.Count); // INTERLOCK unsupported + the "!" strip
+        Assert.Contains(plan.Warnings, w => w.Contains("unsupported", StringComparison.Ordinal));
+        Assert.Contains(plan.Warnings, w => w.Contains('!', StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void BareBangCall_StripsTheBang()
+    {
+        // C 9 !M9YYY-1 — port 9, stripped target.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("C 9 !M9YYY-1"));
+        Assert.Equal("M9YYY-1", plan.Target);
+        Assert.Equal("9", plan.Port);
+        Assert.Single(plan.Warnings);
+    }
+
+    [Fact]
+    public void SecondNcLine_IsASendOnlyStepNotANewOpen()
+    {
+        // Only the FIRST connect verb names the open; a later NC is a node-level command (send-only),
+        // exactly as a later bare "C" is.
+        ConnectPlan plan = ConnectScript.Resolve(PartnerWith("NC GB7BPQ", "NC GB7RDG"));
+        Assert.Equal("GB7BPQ", plan.Target);
+        Assert.Equal(("", "NC GB7RDG"), Pair(Assert.Single(plan.Steps)));
+        Assert.Empty(plan.Warnings);
+    }
 }
