@@ -24,10 +24,13 @@
 #   network    WireGuard handover (CT inherits 10.66.66.6, auto-rollback on failure) +
 #              bring the CT's RF/AXUDP ports up -> GB7RDG on-air, mail STILL HELD.
 #   verify     read-only: confirm on-air health (wg==10.66.66.6, modems, live peers).
-#   connect-test validate each partner's connect script + tighten its EXPECT= from the real
-#              prompt, moving NO mail (the test-connect tool). Run after network, before golive.
-#   golive     >>> POINT OF NO RETURN <<< hard readiness re-check + typed confirm, then
-#              enable forwarding + OARC. Mail starts moving.
+#   connect-test the per-partner BRING-UP: forwarding is gated in TWO tiers now — the whole-BBS
+#              MASTER switch (held) AND every partner imported DISABLED. For each partner: test-connect
+#              (moves NO mail), tighten EXPECT= from the real prompt, then ENABLE it in the BBS UI.
+#              Run after network, before golive. A partner left disabled simply won't forward.
+#   golive     >>> POINT OF NO RETURN <<< hard readiness re-check (incl. >=1 partner ENABLED, else
+#              forwarding would dial no one) + typed confirm, then flip the store-backed MASTER ON +
+#              enable OARC. Mail starts moving to the enabled partners.
 #   validate   post-golive: re-check node/bbs/db vs baseline (pass/fail) + emit the RF
 #              wire-truth checklist to run via the kiss-collector MCP. Run T+15m/+1h/+24h.
 #   abort      reverse freeze/network/sync (valid ONLY before golive).
@@ -175,6 +178,10 @@ PY
 }
 
 gen_bbs() { # gen_bbs <forwarding true|false> -> path
+  # NOTE: bbs.yaml's forwarding.enabled only SEEDS the store-backed master switch on FIRST start
+  # (when the meta key is null). After the sync re-import has seeded it held, this value is IGNORED
+  # — the live master is store-backed (HostComposition.cs: seed-if-null), so the runtime switch
+  # survives restarts. Flip the master at runtime with ct_set_master (below), NOT by re-writing this.
   local fwd="$1" out="$WORK_DIR/bbs.fwd-$1.yaml"
   mkdir -p "$WORK_DIR"
   python3 - "$BBS_HELD" "$out" "$fwd" <<'PY'
@@ -185,6 +192,29 @@ d.setdefault("forwarding", {})["enabled"] = (fwd == "true")
 yaml.safe_dump(d, open(out, "w"), sort_keys=False)
 PY
   echo "$out"
+}
+
+# The whole-BBS forwarding MASTER switch is store-backed (meta.forwarding_master), read LIVE by the
+# scheduler + inbound answerer. The UI toggles it; for the scripted cutover we flip it deterministically
+# in the store while the node is stopped (no auth, no race). gen_bbs(true) at golive would be a NO-OP
+# (the meta key is already seeded held), which would silently leave forwarding held — hence this.
+ct_set_master() { # ct_set_master <1|0>   (1 = forwarding ON, 0 = held)
+  local v="$1"
+  ct "systemctl stop $NODE_SVC; sleep 1
+python3 - <<PY
+import sqlite3
+c=sqlite3.connect('$BBS_STATE/bbs.db')
+c.execute(\"INSERT INTO meta(key,value) VALUES('forwarding_master','$v') ON CONFLICT(key) DO UPDATE SET value=excluded.value\")
+c.commit(); c.close()
+PY
+chown packetnet:packetnet $BBS_STATE/bbs.db
+systemctl start $NODE_SVC; sleep 5
+systemctl is-active $NODE_SVC | grep -qx active" || die "node did not come back active after master flip"
+}
+
+# Count partners currently ENABLED in the store (the per-partner gate; importer lands all disabled).
+ct_enabled_count() {
+  ct "python3 -c \"import sqlite3; print(sqlite3.connect('file:$BBS_STATE/bbs.db?mode=ro',uri=True).execute('SELECT COUNT(*) FROM partners WHERE enabled=1').fetchone()[0])\"" 2>/dev/null | tr -dc '0-9'
 }
 
 # Show the SEMANTIC diff (both sides normalised through safe_dump) so comment/format noise is gone.
@@ -335,25 +365,28 @@ connect-test)
   # Run AFTER 'network' (node on-air), BEFORE 'golive'. Validates each enabled partner's connect
   # script + lets you tighten its EXPECT= strings from the real prompt — WITHOUT moving any mail
   # (the test-connect tool runs the script + the SID/prompt wait, then disconnects; no FBB session).
-  note "CONNECT-TEST — validate + tighten partner connect scripts (on-air, forwarding still HELD)."
-  note "For EACH enabled partner below, in the BBS sysop UI (or an authenticated POST to"
-  note "  /apps/bbs/forwarding/test-connect with partner=CALL):"
-  note "  1. run test-connect — confirm ok=true and READ the transcript/prompt (no mail moves);"
+  note "CONNECT-TEST — validate each partner, then ENABLE the good ones (on-air, forwarding still HELD)."
+  note "Two-tier gate: the whole-BBS MASTER is held AND every partner is imported DISABLED, so nothing"
+  note "moves yet. This phase is the per-partner bring-up. For EACH partner below, in the BBS sysop UI"
+  note "(Forwarding page) — or an authenticated POST to /apps/bbs/forwarding/{test-connect,partner/enable}:"
+  note "  1. click 'Test connect' — confirm ok=true + READ the transcript/prompt (moves NO mail);"
   note "  2. multi-hop scripts (a trailing 'bbs', or a via 'C <next>') — set the partner's EXPECT="
-  note "     to the observed prompt in the forwarding editor, then re-run test-connect to confirm;"
-  note "  3. a partner that will NOT connect — fix its script/route (or disable it) BEFORE golive."
+  note "     to the observed prompt in the forwarding editor, then re-run Test connect to confirm;"
+  note "  3. on a CLEAN connect, click 'Enable' for that partner (it stays gated until you do);"
+  note "  4. a partner that will NOT connect — fix its script/route, or leave it DISABLED."
   note "Direct-BBS partners need only to connect (the FBB SID-wait is the implicit expect);"
   note "only GB7LOX ('… bbs') and GB7CIP ('C GB7WEM-7' → 'C uhf gb7cip') need real EXPECT= steps."
-  note "Enabled partners + their current connect scripts (bbs.db):"
+  note "ALL partners + their current connect script + enabled state (bbs.db):"
   ct "python3 - <<'PY'
 import sqlite3
 c=sqlite3.connect('file:$BBS_STATE/bbs.db?mode=ro',uri=True)
-rows=c.execute(\"SELECT call, connect_script FROM partners WHERE enabled=1 ORDER BY call\").fetchall()
-for call,cs in rows:
-    print('  '+call+': '+repr((cs or '').replace(chr(10),' | ')))
-print('  (enabled partners: '+str(len(rows))+')')
+rows=c.execute(\"SELECT call, enabled, connect_script FROM partners ORDER BY call\").fetchall()
+for call,en,cs in rows:
+    print('  ['+('ENABLED ' if en else 'disabled')+'] '+call+': '+repr((cs or '').replace(chr(10),' | ')))
+print('  (enabled now: '+str(sum(1 for _ ,en,_2 in rows if en))+' / '+str(len(rows))+')')
 PY"
-  note "When every enabled partner connects cleanly, proceed: cutover-gb7rdg.sh golive"
+  note "Enable each partner you have test-connected. golive then refuses unless >=1 partner is enabled."
+  note "When the partners you want are tested + ENABLED, proceed: cutover-gb7rdg.sh golive"
   ;;
 
 golive)
@@ -363,10 +396,15 @@ golive)
   assert_ct_wg_addr || die "readiness: CT wg is not $WG_ADDR (peers could not reach GB7RDG)"
   N="$(ct "ss -tn 2>/dev/null | grep -cE '$KISS_HOST:891[0-3].*ESTAB'" || echo 0)"; [[ "$N" -ge 1 ]] || die "readiness: no kissproxy modem connections — RF ports not up"
   ct "journalctl -u $NODE_SVC --no-pager -n 80 -o cat | grep -i 'forwarding is HELD' | tail -1" | grep -qi HELD || warn "could not confirm forwarding is currently HELD (it should be)"
-  ok "readiness checks passed"
+  # NEW two-tier gate: the master is about to go ON, so at least one partner MUST be enabled — else
+  # golive would succeed into a zero-dial state (forwarding ACTIVE, dialling no one, mail queuing
+  # silently). The operator enables partners in connect-test; this asserts they actually did.
+  EN="$(ct_enabled_count)"; [[ "${EN:-0}" -ge 1 ]] || die "readiness: 0 partners enabled — run connect-test and ENABLE the partners you want before golive (else nothing forwards)"
+  ok "readiness checks passed ($EN partner(s) enabled)"
   echo
   note "############################################################"
-  note "# Enabling forwarding + OARC. Mail starts moving; abort is #"
+  note "# Enabling forwarding (master ON) + ports + OARC. Mail     #"
+  note "# starts moving to the $EN enabled partner(s); abort is    #"
   note "# GONE. Decommission the OLD LinBPQ after this.            #"
   note "############################################################"
   if [[ "${CUTOVER_YES:-0}" != "1" ]]; then
@@ -374,13 +412,19 @@ golive)
     [[ "$a" == "GB7RDG GO" ]] || die "go-live not confirmed"
   fi
   ts=false; [[ -f "$TAILSCALE_KEY" ]] && ts=true
-  NCFG="$(gen_node true true "$ts")"; BCFG="$(gen_bbs true)"
-  ct_apply "$NCFG" "$BCFG"
+  # Node config: ports stay up + OARC reporting ON. (BBS forwarding is NOT driven by yaml any more —
+  # the per-partner enables are already in the store from connect-test; the master is flipped below.)
+  NCFG="$(gen_node true true "$ts")"
+  ct_apply "$NCFG" "-"
+  # Flip the store-backed master ON — THE actual "forwarding starts" step (gen_bbs(true) is a no-op).
+  ct_set_master 1
   sleep 6
   ct "journalctl -u $NODE_SVC --no-pager -n 80 -o cat | grep -iE 'forwarding (ACTIVE|cycle)|OARC reporting|announc' | grep -vi HELD | tail -6 || true"
+  ct "journalctl -u $NODE_SVC --no-pager -n 40 -o cat | grep -i 'forwarding ACTIVE' | tail -1" | grep -qi ACTIVE \
+    || warn "did NOT see 'forwarding ACTIVE' in the log — verify the master flipped on (forwarding_master=1) and partners are draining"
   rm -f "$SYNC_MARKER"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$GOLIVE_MARKER"
-  ok "GO-LIVE applied. Watch forwarding drain + OARC map. Keep the OLD LinBPQ STOPPED (decommissioned)."
+  ok "GO-LIVE applied (master ON, $EN partner(s) enabled). Watch forwarding drain + OARC map. Keep the OLD LinBPQ STOPPED (decommissioned)."
   ok "Now validate: cutover-gb7rdg.sh validate  (at T+15m, T+1h, T+24h)"
   ;;
 
@@ -388,13 +432,24 @@ abort)
   note "ABORT — reverse the cutover (valid ONLY before golive). Restores the OLD node."
   warn "If you have already run 'golive', DO NOT abort — the network has advanced; this cannot undo it."
   confirm "Reverse: re-hold + restore the CT, drop its wg, bring the OLD node back?" || die "aborted-abort"
-  # 1) Re-hold the CT (ports off, forwarding off) and restore its pre-cutover mailbox.
+  # 1) Re-hold the CT (ports off, forwarding off) and restore its pre-cutover mailbox. The store-backed
+  #    master + per-partner enables live in bbs.db, so the pre-cutover restore re-holds both tiers; we
+  #    ALSO force them held explicitly (master=0, every partner disabled) in case the backup is missing
+  #    or connect-test enabled partners — so the CT is definitively held in BOTH directions.
   NCFG="$(gen_node false false false)"; BCFG="$(gen_bbs false)"
   ct "systemctl stop $NODE_SVC"
   ct "if [ -f $BBS_STATE/bbs.db.pre-cutover ]; then mv -f $BBS_STATE/bbs.db.pre-cutover $BBS_STATE/bbs.db; rm -f $BBS_STATE/bbs.db-wal $BBS_STATE/bbs.db-shm; fi"
+  ct "python3 - <<PY
+import sqlite3
+c=sqlite3.connect('$BBS_STATE/bbs.db')
+c.execute(\"INSERT INTO meta(key,value) VALUES('forwarding_master','0') ON CONFLICT(key) DO UPDATE SET value='0'\")
+c.execute('UPDATE partners SET enabled=0')
+c.commit(); c.close()
+PY
+chown packetnet:packetnet $BBS_STATE/bbs.db"
   ct "systemctl start $NODE_SVC"
   ct_apply "$NCFG" "$BCFG"
-  ok "CT re-held + pre-cutover mailbox restored"
+  ok "CT re-held (master off + all partners disabled) + pre-cutover mailbox restored"
   # 2) Drop the CT's wg and VERIFY it is down before re-arming the old node (no dual-claim).
   ct "wg-quick down wg0 2>/dev/null || true"
   ct "wg show wg0 2>/dev/null | grep -q interface" && die "CT wg STILL up — refusing to raise old wg (would dual-claim $WG_ADDR). Fix the CT first." || ok "CT wg down"
