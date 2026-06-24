@@ -20,11 +20,14 @@
 #              correct (forwarding HELD, housekeeping >= BPQ MaxAge). Changes nothing.
 #   freeze     stop LinBPQ on the old box -> GB7RDG off-air, mail files frozen.
 #   sync       pull the FROZEN dump (atomic) -> rebuild bbs.db -> load into the CT (HELD).
+#   baseline   snapshot the held mailbox + node state (for `validate` to diff). Run after sync.
 #   network    WireGuard handover (CT inherits 10.66.66.6, auto-rollback on failure) +
 #              bring the CT's RF/AXUDP ports up -> GB7RDG on-air, mail STILL HELD.
 #   verify     read-only: confirm on-air health (wg==10.66.66.6, modems, live peers).
 #   golive     >>> POINT OF NO RETURN <<< hard readiness re-check + typed confirm, then
 #              enable forwarding + OARC. Mail starts moving.
+#   validate   post-golive: re-check node/bbs/db vs baseline (pass/fail) + emit the RF
+#              wire-truth checklist to run via the kiss-collector MCP. Run T+15m/+1h/+24h.
 #   abort      reverse freeze/network/sync (valid ONLY before golive).
 #   status     show where both nodes currently stand.
 #
@@ -71,6 +74,8 @@ WORK_DIR="${WORK_DIR:-$STAGE_DIR/.cutover-work}"
 SNAP="${SNAP:-$WORK_DIR/snapshot}"
 BUILT_DB="${BUILT_DB:-$WORK_DIR/bbs.db}"
 SYNC_MARKER="${SYNC_MARKER:-$WORK_DIR/.synced}"       # proves a fresh sync preceded golive
+BASELINE_FILE="${BASELINE_FILE:-$WORK_DIR/baseline.env}"  # pre-golive snapshot for `validate` to diff
+GOLIVE_MARKER="${GOLIVE_MARKER:-$WORK_DIR/.golive-utc}"   # records the golive moment (validate uses it)
 
 # --- helpers ----------------------------------------------------------------
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -189,6 +194,24 @@ show_diff() { # show_diff <held-file> <generated-file>
 }
 
 assert_ct_wg_addr() { ct "ip -4 addr show wg0 2>/dev/null | grep -qw $WG_ADDR"; }
+
+# Read bbs.db counts from the CT (read-only) as key=value lines.
+ct_bbs_counts() {
+  ct "python3 - <<'PY'
+import sqlite3
+c=sqlite3.connect('file:$BBS_STATE/bbs.db?mode=ro',uri=True)
+def q(s):
+    try: return c.execute(s).fetchone()[0]
+    except Exception: return -1
+print('msgs='+str(q('SELECT COUNT(*) FROM messages')))
+print('bids='+str(q('SELECT COUNT(*) FROM bids')))
+print('partners='+str(q('SELECT COUNT(*) FROM partners')))
+print('sent='+str(q('SELECT COUNT(*) FROM forwards WHERE forwarded_utc IS NOT NULL')))
+print('queued='+str(q('SELECT COUNT(*) FROM forwards WHERE forwarded_utc IS NULL')))
+print('highwater='+str(q(\"SELECT seq FROM sqlite_sequence WHERE name='messages'\")))
+PY"
+}
+chk() { if eval "$2"; then ok "$1"; else warn "FAIL: $1"; FAILS=$((FAILS+1)); fi; }
 
 # ============================================================================
 phase="${1:-}"; [[ -n "$phase" ]] || { sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
@@ -329,7 +352,9 @@ golive)
   sleep 6
   ct "journalctl -u $NODE_SVC --no-pager -n 80 -o cat | grep -iE 'forwarding (ACTIVE|cycle)|OARC reporting|announc' | grep -vi HELD | tail -6 || true"
   rm -f "$SYNC_MARKER"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$GOLIVE_MARKER"
   ok "GO-LIVE applied. Watch forwarding drain + OARC map. Keep the OLD LinBPQ STOPPED (decommissioned)."
+  ok "Now validate: cutover-gb7rdg.sh validate  (at T+15m, T+1h, T+24h)"
   ;;
 
 abort)
@@ -354,6 +379,65 @@ abort)
   ok "ABORT complete. OLD GB7RDG is live again; the CT is held. A re-cutover MUST start from 'freeze' (fresh sync)."
   ;;
 
+baseline)
+  note "BASELINE — snapshot the held mailbox + node state for 'validate' to diff. Run AFTER 'sync', BEFORE 'golive'."
+  mkdir -p "$WORK_DIR"
+  nv="$(ct "dpkg -l packetnet | tail -1 | awk '{print \\\$3}'")"
+  bv="$(ct "dpkg -l pdn-bbs | tail -1 | awk '{print \\\$3}'")"
+  { echo "# GB7RDG cutover baseline (held, pre-golive)"; echo "node_version=$nv"; echo "bbs_version=$bv"; ct_bbs_counts; } > "$BASELINE_FILE"
+  cat "$BASELINE_FILE"
+  ok "baseline saved -> $BASELINE_FILE"
+  note "ALSO capture the RF wire baseline via the kiss-collector MCP (the reference ranges to validate against):"
+  note "  - per-band 24h frame counts (stats since=24h): 40m busiest, all 4 bands active"
+  note "  - top forwarding partners (top_talkers by=to direction=TX): GB7BPQ/GB7OXF/GB7BSK/EI5IYB + GB7WOD"
+  note "  - channel_wait_ms per band (the CSMA yardstick): 40m ~2s, 70cm ~180ms, 6m ~550ms, 2m ~240ms"
+  ;;
+
+validate)
+  note "VALIDATE — post-golive health vs baseline. Run at T+15m / T+1h / T+24h."
+  [[ -f "$BASELINE_FILE" ]] || die "no baseline ($BASELINE_FILE) — 'baseline' must be run before golive"
+  bval() { grep -oE "^$1=-?[0-9]+" "$BASELINE_FILE" | cut -d= -f2; }
+  b_bids="$(bval bids)"; b_queued="$(bval queued)"; b_hw="$(bval highwater)"; b_msgs="$(bval msgs)"
+  FAILS=0
+  # Precompute the (messy, remote) values FIRST, then chk simple tests on the locals — keeps the
+  # chk eval free of nested ct/$() quoting.
+  hz="$(ct "curl -s -m5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz" 2>/dev/null || echo 000)"
+  act="$(ct "systemctl is-active $NODE_SVC" 2>/dev/null || echo unknown)"
+  modems="$(ct "ss -tn 2>/dev/null | grep -cE '$KISS_HOST:891[0-3].*ESTAB'" 2>/dev/null || echo 0)"
+  fa="$(ct "journalctl -u $NODE_SVC --no-pager -n 300 -o cat | grep -ci 'forwarding ACTIVE'" 2>/dev/null || echo 0)"
+  now="$(ct_bbs_counts)"
+  n_bids="$(grep -oE '^bids=-?[0-9]+' <<<"$now"|cut -d= -f2)"; n_queued="$(grep -oE '^queued=-?[0-9]+' <<<"$now"|cut -d= -f2)"
+  n_hw="$(grep -oE '^highwater=-?[0-9]+' <<<"$now"|cut -d= -f2)"; n_msgs="$(grep -oE '^msgs=-?[0-9]+' <<<"$now"|cut -d= -f2)"
+  # --- node on-air ---
+  chk "node /healthz 200 (got $hz)" "[ \"$hz\" = 200 ]"
+  chk "node service active (got $act)" "[ \"$act\" = active ]"
+  chk "CT wg owns $WG_ADDR" "assert_ct_wg_addr"
+  chk ">=1 kissproxy modem connection (got ${modems:-0})" "[ \"${modems:-0}\" -ge 1 ]"
+  chk "live AXUDP peer GB7NDH (10.66.66.10) reachable" "ct 'ping -c2 -W2 10.66.66.10 >/dev/null 2>&1'"
+  chk "live AXUDP peer GB7BDH (10.66.66.24) reachable" "ct 'ping -c2 -W2 10.66.66.24 >/dev/null 2>&1'"
+  # --- forwarding ON + mailbox sane ---
+  chk "forwarding ACTIVE (not HELD)" "[ \"${fa:-0}\" -ge 1 ]"
+  echo "  baseline: msgs=$b_msgs bids=$b_bids queued=$b_queued hw=$b_hw   now: msgs=$n_msgs bids=$n_bids queued=$n_queued hw=$n_hw"
+  chk "BID dedup store only grows (>= baseline)" "[ \"${n_bids:-0}\" -ge \"${b_bids:-0}\" ]"
+  chk "queue draining (queued <= baseline)" "[ \"${n_queued:-999999}\" -le \"${b_queued:-0}\" ]"
+  chk "high-water carried (>= baseline)" "[ \"${n_hw:-0}\" -ge \"${b_hw:-0}\" ]"
+  chk "message count not collapsing (>= 80% of baseline)" "[ \"${n_msgs:-0}\" -ge \"$(( ${b_msgs:-0} * 8 / 10 ))\" ]"
+  # --- re-flood signal (logs): bodies actually forwarded vs partner BID-rejects on the drain ---
+  if [[ -f "$GOLIVE_MARKER" ]]; then
+    since="$(cat "$GOLIVE_MARKER")"
+    fwd="$(ct "journalctl -u $NODE_SVC --no-pager --since '$since' -o cat | grep -ic 'Forwarded message' || true")"
+    rej="$(ct "journalctl -u $NODE_SVC --no-pager --since '$since' -o cat | grep -icE 'RefusedBid|already' || true")"
+    note "re-flood signal since golive: forwarded(bodies)=$fwd  partner-BID-rejected=$rej  (a healthy drain rejects the backlog dups; a flood = many accepts)"
+  fi
+  echo
+  [[ "$FAILS" -eq 0 ]] && ok "VALIDATE: all bash-reachable checks passed" || warn "VALIDATE: $FAILS check(s) FAILED — investigate before trusting the cutover"
+  note "RF WIRE-TRUTH — run via the kiss-collector MCP and compare to the baseline ranges:"
+  note "  1. GB7RDG is TRANSMITTING since golive on the active bands (search_traffic direction=TX since=$([[ -f $GOLIVE_MARKER ]] && cat $GOLIVE_MARKER || echo '<golive>'))"
+  note "  2. exactly ONE GB7RDG on air (no dual-claim) + ID/BEACON/NODES resumed"
+  note "  3. per-band frames ~ baseline (stats) + forwarding partners unchanged with NO volume spike (top_talkers by=to)"
+  note "  4. channel_wait_ms ~ baseline per band (CSMA sane; near-zero=collisions, huge=stuck)"
+  ;;
+
 status)
   note "OLD box ($BPQ_SSH):"
   bpq "systemctl is-active $BPQ_SERVICE; wg show $BPQ_WG_IFACE 2>/dev/null | grep -E 'interface|latest-hand' | head -2 || echo 'wg down'" || true
@@ -361,5 +445,5 @@ status)
   ct "systemctl is-active $NODE_SVC; ip -4 addr show wg0 2>/dev/null | grep -oE 'inet [0-9.]+' || echo 'wg down'; journalctl -u $NODE_SVC --no-pager -n 60 -o cat | grep -iE 'forwarding is HELD|forwarding ACTIVE|configured port' | tail -2" || true
   ;;
 
-*) die "unknown phase '$phase' (preflight|freeze|sync|network|verify|golive|abort|status)";;
+*) die "unknown phase '$phase' (preflight|freeze|sync|baseline|network|verify|golive|validate|abort|status)";;
 esac
