@@ -2187,7 +2187,8 @@ public sealed class WebmailTests : IAsyncDisposable
 
         string page = await client.GetStringAsync(new Uri("/forwarding", UriKind.Relative));
         Assert.Contains("GB7BPQ", page, StringComparison.Ordinal);
-        Assert.Contains("auto-dial on", page, StringComparison.Ordinal);
+        Assert.Contains(">enabled</span>", page, StringComparison.Ordinal);          // the per-partner gate badge
+        Assert.Contains("Test connect", page, StringComparison.Ordinal);             // the cutover pre-flight button
         Assert.Contains("C GB7BPQ", page, StringComparison.Ordinal);                 // connect script
         Assert.Contains("every 30 min", page, StringComparison.Ordinal);             // schedule
         Assert.Contains("as soon as a message is queued", page, StringComparison.Ordinal);
@@ -2198,7 +2199,72 @@ public sealed class WebmailTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task Forwarding_DisabledPartner_ShowsAutoDialOff()
+    public async Task Forwarding_EnableToggle_FlipsPartnerAndSignalsReconcile()
+    {
+        ClaimCallsign("tom", "G0SYS");
+        _store.UpsertPartner(new Partner { Call = "GB7XYZ", Enabled = false, AtCalls = ["*"] }); // imported disabled
+        using HttpClient client = await StartAsync(pdnUser: "tom", autoRedirect: false);
+
+        // Sysop clicks Enable (the cutover step after a green test-connect).
+        HttpResponseMessage enable = await client.PostAsync(new Uri("/forwarding/partner/enable", UriKind.Relative),
+            new FormUrlEncodedContent([new("call", "GB7XYZ"), new("enabled", "1")]));
+        Assert.Equal(HttpStatusCode.Redirect, enable.StatusCode);
+        Assert.True(_store.GetPartner("GB7XYZ")!.Enabled);
+        Assert.True(_partnersChanged > 0); // reconcile signalled → the loop spins
+
+        // And Disable flips it back (the per-partner abort, gates both directions).
+        await client.PostAsync(new Uri("/forwarding/partner/enable", UriKind.Relative),
+            new FormUrlEncodedContent([new("call", "GB7XYZ"), new("enabled", "0")]));
+        Assert.False(_store.GetPartner("GB7XYZ")!.Enabled);
+    }
+
+    [Fact]
+    public async Task Forwarding_MasterSwitch_TogglesAndPersists()
+    {
+        ClaimCallsign("tom", "G0SYS");
+        using HttpClient client = await StartAsync(pdnUser: "tom", autoRedirect: false);
+
+        // Default (unset) → master ON; the page shows the switch with a "Turn OFF" button.
+        string page = await client.GetStringAsync(new Uri("/forwarding", UriKind.Relative));
+        Assert.Contains("Turn OFF", page, StringComparison.Ordinal);
+
+        // Sysop turns the whole-BBS forwarding OFF (the safe-abort hold).
+        HttpResponseMessage off = await client.PostAsync(new Uri("/forwarding/master", UriKind.Relative),
+            new FormUrlEncodedContent([new("enabled", "0")]));
+        Assert.Equal(HttpStatusCode.Redirect, off.StatusCode);
+        Assert.False(_store.GetForwardingMaster()!.Value); // persisted in the store
+
+        // The page now reflects OFF (an ON button + the held note).
+        string page2 = await client.GetStringAsync(new Uri("/forwarding", UriKind.Relative));
+        Assert.Contains("Turn ON", page2, StringComparison.Ordinal);
+        Assert.Contains("held", page2, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Forwarding_MasterSwitch_NonSysop_Forbidden()
+    {
+        ClaimCallsign("bob", "M0BOB");
+        using HttpClient client = await StartAsync(pdnUser: "bob", autoRedirect: false);
+        HttpResponseMessage r = await client.PostAsync(new Uri("/forwarding/master", UriKind.Relative),
+            new FormUrlEncodedContent([new("enabled", "0")]));
+        Assert.Equal(HttpStatusCode.Forbidden, r.StatusCode);
+    }
+
+    [Fact]
+    public async Task Forwarding_EnableToggle_NonSysop_Forbidden()
+    {
+        ClaimCallsign("bob", "M0BOB"); // mapped, not the sysop (G0SYS)
+        _store.UpsertPartner(new Partner { Call = "GB7XYZ", Enabled = false });
+        using HttpClient client = await StartAsync(pdnUser: "bob", autoRedirect: false);
+
+        HttpResponseMessage r = await client.PostAsync(new Uri("/forwarding/partner/enable", UriKind.Relative),
+            new FormUrlEncodedContent([new("call", "GB7XYZ"), new("enabled", "1")]));
+        Assert.Equal(HttpStatusCode.Forbidden, r.StatusCode);
+        Assert.False(_store.GetPartner("GB7XYZ")!.Enabled); // unchanged
+    }
+
+    [Fact]
+    public async Task Forwarding_DisabledPartner_ShowsDisabledBadgeAndEnableButton()
     {
         ClaimCallsign("tom", "G0SYS");
         _store.UpsertPartner(new Partner { Call = "GB7XYZ", Enabled = false, AtCalls = ["*"] });
@@ -2206,7 +2272,8 @@ public sealed class WebmailTests : IAsyncDisposable
 
         string page = await client.GetStringAsync(new Uri("/forwarding", UriKind.Relative));
         Assert.Contains("GB7XYZ", page, StringComparison.Ordinal);
-        Assert.Contains("auto-dial off", page, StringComparison.Ordinal);
+        Assert.Contains(">disabled</span>", page, StringComparison.Ordinal); // the gate badge
+        Assert.Contains(">Enable</button>", page, StringComparison.Ordinal);  // one-click enable (it's disabled)
     }
 
     [Fact]

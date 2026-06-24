@@ -346,6 +346,38 @@ public static class Webmail
             return ForwardNow(options, prefix, call, form["call"].ToString(), embed, Theme(ctx));
         });
 
+        // One-click enable/disable for a partner (the cutover loop: test-connect → enable). Disabling
+        // gates BOTH directions (no dial-out, no inbound-accept). Mirrors forward-now's gating + signal.
+        app.MapPost("/forwarding/partner/enable", async (HttpContext ctx) =>
+        {
+            string prefix = Prefix(ctx);
+            bool embed = Embed(ctx);
+            string? call = FindCallsign(options.Store, PdnUser(ctx));
+            if (call is null)
+            {
+                return Results.Redirect(U(prefix, "/", embed));
+            }
+
+            IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
+            return SetPartnerEnabled(options, prefix, call, form["call"].ToString(), form["enabled"].ToString() == "1", embed, Theme(ctx));
+        });
+
+        // The whole-BBS forwarding master switch (the safe-abort hold). Off = no dialling out AND no
+        // inbound accepted, regardless of any partner's Enabled. Persisted in the store + read live.
+        app.MapPost("/forwarding/master", async (HttpContext ctx) =>
+        {
+            string prefix = Prefix(ctx);
+            bool embed = Embed(ctx);
+            string? call = FindCallsign(options.Store, PdnUser(ctx));
+            if (call is null)
+            {
+                return Results.Redirect(U(prefix, "/", embed));
+            }
+
+            IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
+            return SetForwardingMaster(options, prefix, call, form["enabled"].ToString() == "1", embed, Theme(ctx));
+        });
+
         app.MapPost("/forwarding/yaml", async (HttpContext ctx) =>
         {
             string prefix = Prefix(ctx);
@@ -1608,10 +1640,34 @@ public static class Webmail
         return Html(Page(o, prefix, call, "Forwarding", embed,
             $"""
             <h2>Forwarding partners <span class="dim">— {partners.Count} configured</span></h2>
+            {MasterSwitch(o, prefix, embed)}
             {tabs}
             {banner}
             {body}
             """, theme), status);
+    }
+
+    /// <summary>
+    /// The whole-BBS forwarding master switch — the safe-abort hold. On = partners are dialled +
+    /// inbound accepted (subject to each partner's own enable); OFF = nothing forwards in EITHER
+    /// direction regardless of per-partner settings. Persisted; survives a restart.
+    /// </summary>
+    private static string MasterSwitch(WebmailOptions o, string prefix, bool embed)
+    {
+        bool on = o.Store.GetForwardingMaster() ?? true;
+        string state = on
+            ? """<span class="badge on">ON</span> — partners forward (each subject to its own enable)"""
+            : """<span class="badge off">OFF</span> — held: nothing forwards in or out, whatever the partners say""";
+        string button = on
+            ? $"""<input type="hidden" name="enabled" value="0"><button type="submit" class="btn danger">Turn OFF (hold all forwarding)</button>"""
+            : $"""<input type="hidden" name="enabled" value="1"><button type="submit" class="btn primary">Turn ON</button>""";
+        return $"""
+            <fieldset class="master-switch">
+            <legend>Forwarding</legend>
+            <p>{state}</p>
+            <form method="post" action="{U(prefix, "/forwarding/master", embed)}">{EmbedField(embed)}{button}</form>
+            </fieldset>
+            """;
     }
 
     /// <summary>
@@ -1643,9 +1699,49 @@ public static class Webmail
             {
                 sb.Append(PartnerCard(o, prefix, embed, p));
             }
+
+            // The "Test connect" buttons POST to the sysop test-connect probe (moves no mail) and
+            // render the SID / transcript / warnings inline — the cutover pre-flight before Enable.
+            sb.Append(TestConnectScript(U(prefix, "/forwarding/test-connect", embed)));
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>The inline JS + style backing the per-partner "Test connect" buttons (one copy per list).</summary>
+    private static string TestConnectScript(string postUrl)
+    {
+        // Non-interpolated raw string (the JS is brace-heavy and would fight string interpolation);
+        // the POST URL is substituted via a placeholder. Callsign + URL are quote-free, so no escaping.
+        const string template = """
+            <style>
+            .tc-result{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.85em;
+              margin:.4rem 0 0;padding:.5rem .6rem;border-radius:6px;background:#0001;border:1px solid #0002;}
+            .tc-result.ok{background:#14803115;border-color:#14803140;}
+            .tc-result.fail{background:#b9261515;border-color:#b9261540;}
+            </style>
+            <script>
+            function pdnTestConnect(call){
+              var box=document.getElementById('tc-'+call);
+              if(!box)return;
+              box.hidden=false; box.className='tc-result'; box.textContent='Testing '+call+'…';
+              var fd=new FormData(); fd.append('partner', call);
+              fetch('__POST_URL__',{method:'POST',body:fd,headers:{'Accept':'application/json'}})
+                .then(function(r){return r.json();})
+                .then(function(d){
+                  var L=[];
+                  L.push((d.ok?'✓ OK':'✗ FAILED')+' — '+(d.target||call)+(d.port?(' (port '+d.port+')'):''));
+                  if(d.sid)L.push('SID: '+d.sid);
+                  if(d.error)L.push('Error: '+d.error);
+                  var w=d.plan&&d.plan.warnings; if(w&&w.length)L.push('Warnings: '+w.join(' | '));
+                  if(d.transcript&&d.transcript.length)L.push('— transcript —\n'+d.transcript.join('\n'));
+                  box.textContent=L.join('\n'); box.className='tc-result '+(d.ok?'ok':'fail');
+                })
+                .catch(function(e){box.textContent='Test failed: '+e; box.className='tc-result fail';});
+            }
+            </script>
+            """;
+        return template.Replace("__POST_URL__", postUrl, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -1655,8 +1751,8 @@ public static class Webmail
     private static string PartnerCard(WebmailOptions o, string prefix, bool embed, Partner p)
     {
         string badge = p.Enabled
-            ? """<span class="badge on">auto-dial on</span>"""
-            : """<span class="badge off">auto-dial off</span>""";
+            ? """<span class="badge on">enabled</span>"""
+            : """<span class="badge off">disabled</span>""";
 
         int queued = o.Store.GetForwardQueue(p.Call).Count;
         int held = o.Store.CountHeldForwards(p.Call);
@@ -1681,14 +1777,23 @@ public static class Webmail
 
         string mode = p.AllowB2F ? "B2 (binary capable)" : "B1 (text only)";
 
-        // Action row: Edit (→ the focused edit form), Forward now + Delete (POSTs); buttons, not links.
+        // Action row: Test connect (the cutover pre-flight — validates the script, moves no mail),
+        // Enable/Disable (one click, gates both directions), Edit, Forward now, Delete. The cutover
+        // loop is Test connect → see a green SID → Enable.
         string editHref = U(prefix, Inv($"/forwarding?edit={Uri.EscapeDataString(p.Call)}"), embed);
+        string callJs = H(p.Call); // callsigns are normalised [A-Z0-9-], quote-free → safe in the JS arg
+        string toggle = p.Enabled
+            ? $"""<form method="post" action="{U(prefix, "/forwarding/partner/enable", embed)}">{EmbedField(embed)}<input type="hidden" name="call" value="{H(p.Call)}"><input type="hidden" name="enabled" value="0"><button type="submit" class="btn">Disable</button></form>"""
+            : $"""<form method="post" action="{U(prefix, "/forwarding/partner/enable", embed)}">{EmbedField(embed)}<input type="hidden" name="call" value="{H(p.Call)}"><input type="hidden" name="enabled" value="1"><button type="submit" class="btn primary">Enable</button></form>""";
         string actions = $"""
             <div class="card-actions">
+            <button type="button" class="btn" onclick="pdnTestConnect('{callJs}')">Test connect</button>
+            {toggle}
             <a class="btn" href="{editHref}">Edit</a>
             <form method="post" action="{U(prefix, "/forwarding/partner/forward-now", embed)}">{EmbedField(embed)}<input type="hidden" name="call" value="{H(p.Call)}"><button type="submit" class="btn">Forward now</button></form>
             <form method="post" action="{U(prefix, "/forwarding/partner/delete", embed)}">{EmbedField(embed)}<input type="hidden" name="call" value="{H(p.Call)}"><button type="submit" class="btn danger">Delete</button></form>
             </div>
+            <div class="tc-result" id="tc-{H(p.Call)}" hidden></div>
             """;
 
         return $$"""
@@ -1869,6 +1974,40 @@ public static class Webmail
 
         o.OnForwardNow?.Invoke(normalized);
         return Results.Redirect(U(prefix, "/forwarding", embed) + Notice(embed, $"Forwarding to {normalized} now."));
+    }
+
+    private static IResult SetPartnerEnabled(WebmailOptions o, string prefix, string call, string partnerCall, bool enabled, bool embed, string? theme)
+    {
+        if (!IsSysop(o, call))
+        {
+            return Forwarding(o, prefix, call, tab: null, editCall: null, embed, theme, status: StatusCodes.Status403Forbidden);
+        }
+
+        string normalized = Callsigns.Normalize(partnerCall);
+        Partner? partner = o.Store.GetPartner(normalized);
+        if (partner is null)
+        {
+            return Results.Redirect(U(prefix, "/forwarding", embed) + Notice(embed, $"No partner '{normalized}'."));
+        }
+
+        o.Store.UpsertPartner(partner with { Enabled = enabled });
+        o.OnPartnersChanged?.Invoke(); // reconcile: spin the loop on enable, or reap it on disable
+        string verb = enabled ? "enabled" : "disabled";
+        return Results.Redirect(U(prefix, "/forwarding", embed) + Notice(embed, $"{normalized} {verb}."));
+    }
+
+    private static IResult SetForwardingMaster(WebmailOptions o, string prefix, string call, bool enabled, bool embed, string? theme)
+    {
+        if (!IsSysop(o, call))
+        {
+            return Forwarding(o, prefix, call, tab: null, editCall: null, embed, theme, status: StatusCodes.Status403Forbidden);
+        }
+
+        o.Store.SetForwardingMaster(enabled);
+        o.OnPartnersChanged?.Invoke(); // reconcile: the scheduler re-reads the master live + spins/reaps loops
+        string state = enabled ? "ON — partners will be dialled and inbound accepted"
+                               : "OFF — the whole-BBS hold: no dialling, no inbound, regardless of per-partner settings";
+        return Results.Redirect(U(prefix, "/forwarding", embed) + Notice(embed, $"Forwarding master {state}."));
     }
 
     /// <summary>
