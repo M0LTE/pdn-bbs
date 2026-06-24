@@ -91,6 +91,10 @@ warn() { echo "  [!!] $*" >&2; }
 confirm() { [[ "${CUTOVER_YES:-0}" == "1" ]] && return 0; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
 
 bpq()    { ssh "$BPQ_SSH" "$BPQ_SUDO bash -lc \"$1\""; }            # run as root on the old box
+# True iff the old LinBPQ is STOPPED. NB: `systemctl is-active` EXITS 3 for an inactive unit, so the
+# old `is-active | grep` form returned 3 under `set -o pipefail` (the pipe takes is-active's exit, not
+# grep's match) — it could NEVER pass for a stopped service. Compare the OUTPUT string instead.
+bpq_inactive() { [[ "$(bpq "systemctl is-active $BPQ_SERVICE" 2>/dev/null || true)" == inactive ]]; }
 ct()     { ssh "$PVE_SSH" "pct exec $CTID -- bash -lc \"$1\""; }    # run in the CT (via the PVE host)
 ct_push(){ # ct_push <local> <ct-path>  — temp file on the PVE host is always cleaned up
   scp -q "$1" "$PVE_SSH:/tmp/.cutover.$$" || die "scp to PVE host failed ($1)"
@@ -240,7 +244,7 @@ print('bids='+str(q('SELECT COUNT(*) FROM bids')))
 print('partners='+str(q('SELECT COUNT(*) FROM partners')))
 print('sent='+str(q('SELECT COUNT(*) FROM forwards WHERE forwarded_utc IS NOT NULL')))
 print('queued='+str(q('SELECT COUNT(*) FROM forwards WHERE forwarded_utc IS NULL')))
-print('highwater='+str(q(\"SELECT seq FROM sqlite_sequence WHERE name='messages'\")))
+print('highwater='+str(q('SELECT seq FROM sqlite_sequence WHERE name='+chr(39)+'messages'+chr(39))))
 PY"
 }
 chk() { if eval "$2"; then ok "$1"; else warn "FAIL: $1"; FAILS=$((FAILS+1)); fi; }
@@ -278,20 +282,23 @@ preflight)
 freeze)
   note "FREEZE — stop LinBPQ on $BPQ_SSH. GB7RDG goes OFF-AIR; mail files become consistent."
   confirm "Stop $BPQ_SERVICE on the OLD box now?" || die "aborted"
-  bpq "systemctl stop $BPQ_SERVICE"; sleep 3
-  bpq "systemctl is-active $BPQ_SERVICE" | grep -qx inactive && ok "LinBPQ stopped; GB7RDG off-air, mail frozen" || die "LinBPQ still active — STOP before continuing"
+  bpq "systemctl stop $BPQ_SERVICE"
+  # POLL until inactive — LinBPQ's graceful shutdown (closing L2 links) outlives a fixed sleep, so it
+  # is briefly "deactivating" before "inactive". Wait it out (up to ~40s) rather than checking once.
+  for _i in $(seq 1 20); do bpq_inactive && break; sleep 2; done
+  bpq_inactive && ok "LinBPQ stopped; GB7RDG off-air, mail frozen" || die "LinBPQ still active after 40s — STOP before continuing"
   ok "Next: cutover-gb7rdg.sh sync"
   ;;
 
 sync)
   note "SYNC — pull the FROZEN dump (atomic), rebuild bbs.db, load into the CT (still HELD)."
-  bpq "systemctl is-active $BPQ_SERVICE" | grep -qx inactive || die "LinBPQ still running — run 'freeze' first (dump would be inconsistent)"
+  bpq_inactive || die "LinBPQ still running — run 'freeze' first (dump would be inconsistent)"
   rm -rf "$SNAP"; mkdir -p "$SNAP"
   note "pulling an atomic snapshot from $BPQ_SSH:$BPQ_DIR ..."
   # ONE tar over the wire = a single consistent snapshot (no inter-file mutation window).
   bpq "cd $BPQ_DIR && tar -cf - DIRMES.SYS WFBID.SYS linmail.cfg Mail" | tar -C "$SNAP" -xf - || die "atomic dump pull failed"
   # Re-assert LinBPQ stayed stopped across the pull (catch a cron/restart mutating mid-snapshot).
-  bpq "systemctl is-active $BPQ_SERVICE" | grep -qx inactive || die "LinBPQ became active DURING the pull — snapshot may be inconsistent; re-freeze + re-sync"
+  bpq_inactive || die "LinBPQ became active DURING the pull — snapshot may be inconsistent; re-freeze + re-sync"
   [[ -f "$SNAP/DIRMES.SYS" && -f "$SNAP/WFBID.SYS" ]] || die "snapshot missing DIRMES.SYS/WFBID.SYS"
   ok "atomic dump staged at $SNAP"
   note "building importer + dry-run validation ..."
@@ -333,9 +340,18 @@ network)
   restore_old_wg() { warn "CT wg bring-up FAILED — restoring old box wg ($WG_ADDR back on the old node)"; bpq "wg-quick up $BPQ_WG_IFACE || true"; }
   trap 'restore_old_wg; die "WireGuard handover failed; old node restored on the mesh. Investigate before retrying network."' ERR
   ct "wg-quick down wg0 2>/dev/null || true; wg-quick up wg0"
-  sleep 3
-  assert_ct_wg_addr || { false; }                       # triggers the ERR trap -> restore + die
-  ct "wg show wg0 latest-handshakes | awk '{print \\\$2}' | grep -qvx 0" || { false; }   # require a handshake
+  sleep 2
+  assert_ct_wg_addr || { false; }                       # address is assigned locally (immediate); else trap -> restore + die
+  # WireGuard is LAZY — it does not handshake until traffic flows, so checking latest-handshakes first
+  # always sees 0. GENERATE traffic (ping a known-live peer THROUGH the tunnel) to trigger the CT<->hub
+  # handshake, THEN verify a handshake landed. Poll to ride out a slow first handshake. (We check the
+  # handshake, not the ping result, so a transiently-down peer doesn't false-fail a working tunnel.)
+  hs=0
+  for _i in $(seq 1 10); do
+    ct "ping -c1 -W2 $WG_PROBE >/dev/null 2>&1 || true; wg show wg0 latest-handshakes | awk '{print \\\$2}' | grep -qvx 0" && { hs=1; break; }
+    sleep 2
+  done
+  [[ "$hs" == 1 ]] || { false; }                        # no hub handshake after ~20s of traffic -> trap -> restore + die
   trap - ERR
   ok "CT wg up as $WG_ADDR with a hub handshake"
   ct "ping -c2 -W2 $WG_PROBE >/dev/null 2>&1" && ok "CT reaches a live AXUDP peer ($WG_PROBE)" || warn "CT cannot ping $WG_PROBE yet (peer may be transiently down)"
@@ -353,7 +369,12 @@ verify)
   note "VERIFY (read-only) — on-air health BEFORE the irreversible forwarding flip."
   ct "curl -s -m5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz" | grep -qx 200 && ok "node healthy" || warn "node /healthz not 200"
   assert_ct_wg_addr && ok "CT wg owns $WG_ADDR" || warn "CT wg is NOT $WG_ADDR — peers addressing GB7RDG will not reach it"
-  N="$(ct "ss -tn 2>/dev/null | grep -cE '$KISS_HOST:891[0-3].*ESTAB'" || echo 0)"; [[ "$N" -ge 1 ]] && ok "CT has $N kissproxy modem connection(s)" || warn "no modem connections to $KISS_HOST — RF ports not up"
+  # `ss` renders the peer as [::ffff:10.45.0.121]:8912 with ESTAB at the line START, so the old
+  # '$KISS_HOST:891x.*ESTAB' pattern could NEVER match (a ']' sits before the colon; ESTAB precedes
+  # the address). `ss -tn` lists only established sockets, so match the host (fixed-string, dots-safe)
+  # then count the 891x peer ports. `|| true` stops grep -c's exit-1-on-zero from tripping pipefail;
+  # `tr -dc` collapses the output to a clean integer (the old `|| echo 0` double-printed -> "0\n0").
+  N="$(ct "ss -tn 2>/dev/null | grep -F '$KISS_HOST' | grep -cE ':891[0-3]' || true" | tr -dc 0-9)"; [[ "${N:-0}" -ge 1 ]] && ok "CT has $N kissproxy modem connection(s)" || warn "no modem connections to $KISS_HOST — RF ports not up"
   ct "ping -c2 -W2 $WG_PROBE >/dev/null 2>&1" && ok "live AXUDP peer $WG_PROBE reachable" || warn "$WG_PROBE unreachable"
   note "recent node log (links / netrom / AXUDP peers):"
   ct "journalctl -u $NODE_SVC --no-pager -n 40 -o cat | grep -iE 'listening|netrom|link|node|axudp|peer' | tail -10 || true"
@@ -442,12 +463,14 @@ abort)
   ct "python3 - <<PY
 import sqlite3
 c=sqlite3.connect('$BBS_STATE/bbs.db')
-c.execute(\"INSERT INTO meta(key,value) VALUES('forwarding_master','0') ON CONFLICT(key) DO UPDATE SET value='0'\")
+c.execute('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?', ('forwarding_master','0','0'))
 c.execute('UPDATE partners SET enabled=0')
 c.commit(); c.close()
 PY
 chown packetnet:packetnet $BBS_STATE/bbs.db"
-  ct "systemctl start $NODE_SVC"
+  # Apply the HELD config (ports off) + start the node HELD via ct_apply — do NOT start it first here:
+  # that brings the node up on the still-stored ports-ENABLED config for a beat (a stray on-air frame
+  # as GB7RDG-2). ct_apply does its own stop+import+start, so the node comes up already held.
   ct_apply "$NCFG" "$BCFG"
   ok "CT re-held (master off + all partners disabled) + pre-cutover mailbox restored"
   # 2) Drop the CT's wg and VERIFY it is down before re-arming the old node (no dual-claim).
