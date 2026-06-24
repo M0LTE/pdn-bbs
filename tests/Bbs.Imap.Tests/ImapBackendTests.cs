@@ -24,6 +24,23 @@ public sealed class ImapBackendTests
     }
 
     [Fact]
+    public void Authenticate_Success_RecordsLastLogin_FailureDoesNot()
+    {
+        using var test = new TestStore();
+        test.Store.SetMailPassword("M0LTE", "correct horse");
+        var backend = new ImapBackend(test.Store);
+
+        // A failed auth (unknown user) must NOT record a login.
+        Assert.Null(backend.Authenticate("G0XYZ", "correct horse"));
+        Assert.Null(test.Store.GetUser("G0XYZ")?.LastLogin);
+
+        // A successful IMAP auth IS a login event — recorded so per-user mailbox stats (last-login)
+        // stay honest for users who only ever connect via IMAP, not just the RF console.
+        Assert.Equal("M0LTE", backend.Authenticate("M0LTE-7", "correct horse"));
+        Assert.NotNull(test.Store.GetUser("M0LTE")!.LastLogin);
+    }
+
+    [Fact]
     public void Inbox_HoldsOnlyPersonalsAddressedToTheCallsign()
     {
         using var test = new TestStore();
