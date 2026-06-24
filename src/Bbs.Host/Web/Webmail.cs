@@ -387,6 +387,12 @@ public static class Webmail
         app.MapGet("/status.json", (HttpContext ctx) => WithCallsign(ctx, options,
             (_, call) => StatusJson(options, call)));
 
+        // Per-user mailbox stats (sysop only, gated like /status.json): last-login, inbox total vs
+        // unread, sent total — for "who's active / who has unread mail". All derived from existing
+        // tables (users + recipients), no schema change.
+        app.MapGet("/status/users.json", (HttpContext ctx) => WithCallsign(ctx, options,
+            (_, call) => StatusUsersJson(options, call)));
+
         // The runtime log-level switch (sysop-only), gated like the Status/Forwarding page. GET shows
         // the current overrides; POST sets or clears one. Minimal, no HTML chrome needed for GET JSON.
         app.MapGet("/loglevel", (HttpContext ctx) => WithCallsign(ctx, options,
@@ -774,6 +780,54 @@ public static class Webmail
             uptimeSeconds = UptimeSeconds(o),
             messages = new { total, held, unreadInbox },
             partners,
+        }, JsonOpts);
+    }
+
+    /// <summary>
+    /// Per-user mailbox stats as JSON (sysop only, gated EXACTLY like <see cref="StatusJson"/>). One row
+    /// per record in the <c>users</c> table — for GB7RDG these are the personal users carried over by the
+    /// importer (BBS partners and the own record are excluded at import). Every field is derived from
+    /// existing tables (no schema change): <c>lastLogin</c> from the user row (seeded from BPQ field 13 at
+    /// import, refreshed on RF console + IMAP login); inbox <c>total</c>/<c>unread</c> via the same
+    /// homed-personals + base-match definition as <see cref="UnreadInbox"/> so they can't disagree;
+    /// <c>sent.total</c> via the FromCall query. Tom uses this as the "who's active / who has unread"
+    /// state read (he asked the assistant to check state on demand rather than wiring alerting).
+    /// </summary>
+    private static IResult StatusUsersJson(WebmailOptions o, string call)
+    {
+        if (!IsSysop(o, call))
+        {
+            return Results.Json(new { error = "sysop only" }, JsonOpts, statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        var users = new List<object>();
+        foreach (User u in o.Store.ListUsers().OrderBy(u => u.Callsign, StringComparer.OrdinalIgnoreCase))
+        {
+            IReadOnlyList<Message> inbox = o.Store.ListMessages(
+                new MessageQuery { Type = MessageType.Personal, ToCall = u.Callsign, HomedLocally = true });
+            int total = inbox.Count(m => m.Recipients.Any(r => Callsigns.BaseEquals(r.ToCall, u.Callsign)));
+            int unread = inbox.Count(m =>
+                m.Recipients.Any(r => Callsigns.BaseEquals(r.ToCall, u.Callsign) && r.ReadAt is null));
+            int sent = o.Store.ListMessages(new MessageQuery { FromCall = u.Callsign }).Count;
+
+            users.Add(new
+            {
+                callsign = u.Callsign,
+                name = u.Name,
+                homeBbs = u.HomeBbs,
+                lastLogin = u.LastLogin?.UtcDateTime,
+                lastListedNumber = u.LastListedNumber,
+                inbox = new { total, unread },
+                sent = new { total = sent },
+            });
+        }
+
+        return Results.Json(new
+        {
+            version = o.Version,
+            uptimeSeconds = UptimeSeconds(o),
+            userCount = users.Count,
+            users,
         }, JsonOpts);
     }
 

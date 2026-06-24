@@ -81,7 +81,12 @@ public sealed class ImapBackend
             return null;
         }
 
-        return Callsigns.StripSsid(Callsigns.Normalize(user));
+        string call = Callsigns.StripSsid(Callsigns.Normalize(user));
+        // A successful IMAP auth is a genuine login event — record it so the per-user mailbox stats
+        // (last-login) stay honest for users who only ever come in via IMAP, not just RF console
+        // connects (BbsConsoleSession.TouchLastLogin). Imported BPQ last-connect is the starting point.
+        _store.TouchLastLogin(call);
+        return call;
     }
 
     /// <summary>

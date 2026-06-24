@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using Bbs.Console;
 using Bbs.Core;
 using Bbs.Fbb;
@@ -233,6 +235,53 @@ public sealed class WebmailTests : IAsyncDisposable
         Assert.Equal(MessageStatus.Held, stored.Status);
         Assert.NotNull(stored.SendReleaseUtc);
         Assert.Empty(_store.GetForwardQueue("GB7BPQ"));
+    }
+
+    [Fact]
+    public async Task StatusUsersJson_Sysop_ReturnsPerUserInboxUnreadAndSentCounts()
+    {
+        ClaimCallsign("sysop", "G0SYS"); // the sysop identity (gate matches SysopCallsign)
+        _store.UpsertUser(new User { Callsign = "M0ABC", Name = "Alice" });
+
+        // Two personals homed to M0ABC (not routed to a partner, so HomedLocally); mark one read so
+        // inbox total=2, unread=1 — proving the two are computed independently.
+        Message read = _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "G7XYZ", Recipients = ["M0ABC"],
+            Subject = "read one", Body = Encoding.Latin1.GetBytes("x\r"),
+        });
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "G7XYZ", Recipients = ["M0ABC"],
+            Subject = "unread one", Body = Encoding.Latin1.GetBytes("y\r"),
+        });
+        _store.MarkRead(read.Number, "M0ABC");
+        // One sent BY M0ABC.
+        _store.AddMessage(new MessageDraft
+        {
+            Type = MessageType.Personal, From = "M0ABC", Recipients = ["G7XYZ"],
+            Subject = "sent one", Body = Encoding.Latin1.GetBytes("z\r"),
+        });
+
+        using HttpClient client = await StartAsync(pdnUser: "sysop");
+        JsonElement json = (await client.GetFromJsonAsync<JsonElement>(
+            new Uri("/status/users.json", UriKind.Relative))).Clone();
+
+        JsonElement m0abc = json.GetProperty("users").EnumerateArray()
+            .Single(u => u.GetProperty("callsign").GetString() == "M0ABC");
+        Assert.Equal("Alice", m0abc.GetProperty("name").GetString());
+        Assert.Equal(2, m0abc.GetProperty("inbox").GetProperty("total").GetInt32());
+        Assert.Equal(1, m0abc.GetProperty("inbox").GetProperty("unread").GetInt32());
+        Assert.Equal(1, m0abc.GetProperty("sent").GetProperty("total").GetInt32());
+    }
+
+    [Fact]
+    public async Task StatusUsersJson_NonSysop_Returns403()
+    {
+        ClaimCallsign("tom", "M0LTE"); // mapped, but not the sysop (G0SYS)
+        using HttpClient client = await StartAsync(pdnUser: "tom");
+        HttpResponseMessage response = await client.GetAsync(new Uri("/status/users.json", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 
     [Fact]
