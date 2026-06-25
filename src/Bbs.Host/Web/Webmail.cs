@@ -2007,7 +2007,7 @@ public static class Webmail
           function inp(v,p){var e=el('input'); e.type='text'; e.autocomplete='off'; if(v!=null)e.value=v; if(p)e.placeholder=p; return e;}
           function lbl(t,ctl){var l=el('label','cs-adv-item'); l.append(el('span','dim',t),ctl); return l;}
           function sel(opts,cur){var s=el('select'); opts.forEach(function(o){var op=el('option',null,o); op.value=o; if(o===cur)op.selected=true; s.append(op);}); return s;}
-          function ws(input,span){var v=input.value; if(v.length && (/^\s/.test(v)||/\s$/.test(v))){span.textContent='“'+v.replace(/ /g,'␣')+'”'; span.hidden=false;} else {span.hidden=true;}}
+          function ws(input,span){var v=input.value; if(v.length && (/^\s/.test(v)||/\s$/.test(v))){span.textContent='“'+v.replace(/ /g,'␣').replace(/\t/g,'⇥')+'”'; span.hidden=false;} else {span.hidden=true;}}
           function renumber(){var i=1; stepsEl.querySelectorAll('.cs-step').forEach(function(r){r.querySelector('.cs-num').textContent=(i++)+'.';});}
           function makeRow(step){
             step=step||{};
@@ -2075,8 +2075,10 @@ public static class Webmail
             probeSrc.onmessage=function(e){
               var d; try{d=JSON.parse(e.data);}catch(err){return;}
               if(d.type==='line'){
+                // Test connect VALIDATES the whole script: its lines are a read-only transcript, not build
+                // material, so (unlike the ⤓ probe) they carry NO "use" button — "use" appends a step, which
+                // makes no sense on a script you are checking end-to-end (esp. one that just succeeded).
                 var ln=el('div','cs-tline'); ln.append(el('span',null,d.text));
-                if(d.text.indexOf('< ')===0 && d.text.indexOf('< (matched')!==0){ var u=el('button','btn cs-mini','use'); u.type='button'; u.onclick=function(){ addStep({expect:d.text.slice(2)}); }; ln.append(u); }
                 tlines.append(ln);
               } else if(d.type==='result'){ tdone=true; var r; try{r=JSON.parse(d.text);}catch(err){r={};}
                 out.className='tc-result '+(r.ok?'ok':'fail');
@@ -2084,7 +2086,7 @@ public static class Webmail
                 closeProbe();
               } else if(d.type==='error'){ tdone=true; out.className='tc-result fail'; thead.textContent='Error: '+d.text; closeProbe(); }
             };
-            probeSrc.onerror=function(){ closeProbe(); if(!tdone){ tdone=true; out.className='tc-result fail'; thead.textContent=tlines.children.length?'Connection lost mid-stream.':'Test failed to start (node host unreachable or RHP link down).'; } };
+            probeSrc.onerror=function(){ closeProbe(); if(!tdone){ tdone=true; out.className='tc-result fail'; thead.textContent=tlines.children.length?'Connection lost mid-stream.':'Couldn’t start the test — check you’re still signed in as sysop, and the node host / RHP link is up.'; } };
           }); }
           function closeProbe(){ if(probeSrc){ try{probeSrc.close();}catch(e){} probeSrc=null; } }
           function tailOf(t){
@@ -2100,8 +2102,9 @@ public static class Webmail
           function probeToHere(row){
             if(!ed.dataset.editing) return;
             serialize();
-            // stopBefore = the index of this row among the NON-EMPTY steps serialize() actually sends
-            // (empty rows are dropped server-side), so it lines up 1:1 with the resolved plan.Steps.
+            // stopBefore = the index of this row among the NON-EMPTY steps serialize() actually sends.
+            // Empty rows are dropped CLIENT-side by serialize(); the idx loop below uses that same
+            // non-empty predicate, and Resolve drops nothing, so idx lines up 1:1 with plan.Steps.
             var idx=0, rows=stepsEl.querySelectorAll('.cs-step');
             for(var j=0;j<rows.length;j++){ if(rows[j]===row) break; if(Object.keys(rows[j]._get()).length) idx++; }
             closeProbe();
@@ -2117,25 +2120,29 @@ public static class Webmail
             bar.append(useBtn,stopBtn);
             out.append(head,lines,el('div','dim','— live —'),live,promptRow,bar);
             var raw='', finished=false;
-            function updateTail(){ var t=tailOf(raw); tailEl.dataset.raw=t; tailEl.textContent='“'+t.replace(/ /g,'␣')+'”'; }
+            function updateTail(){ var t=tailOf(raw); tailEl.dataset.raw=t; tailEl.textContent='“'+t.replace(/ /g,'␣').replace(/\t/g,'⇥')+'”'; }
             updateTail();
             function fill(text){ var ex=row.querySelector('.cs-expect'); ex.value=text; ws(ex, row.querySelector('.cs-ws')); }
-            useBtn.onclick=function(){ finished=true; fill(tailEl.dataset.raw||''); closeProbe(); out.className='tc-result ok'; head.textContent='Captured — Wait-for set to the highlighted prompt. Edit it if you want a shorter substring.'; };
+            useBtn.onclick=function(){ var cap=tailEl.dataset.raw||''; if(!cap){ head.textContent='Nothing captured yet — wait for the node prompt to arrive (or press ⤓ again).'; return; } finished=true; fill(cap); closeProbe(); out.className='tc-result ok'; head.textContent='Captured — Wait-for set to the highlighted prompt. Edit it if you want a shorter substring.'; };
             stopBtn.onclick=function(){ finished=true; closeProbe(); head.textContent='Stopped.'; };
             var q='partner='+encodeURIComponent(ed.dataset.call)+'&stopBefore='+idx+'&steps='+encodeURIComponent(jsonEl.value);
             probeSrc=new EventSource(ed.dataset.probe+(ed.dataset.probe.indexOf('?')<0?'?':'&')+q);
             probeSrc.onmessage=function(e){
               var d; try{d=JSON.parse(e.data);}catch(err){return;}
               if(d.type==='line'){
+                // Replayed prefix transcript = read-only context for the steps ABOVE this row (matched
+                // markers, plus node FAILURE/progress lines like "< BUSY"). It is NOT this row's prompt —
+                // that arrives as the live 'chunk' bytes below — so it carries no per-line "use" button
+                // (capturing "BUSY" as a Wait-for is exactly the mislead removed from Test connect). The
+                // designed capture for this row is the live tail + the "Use as Wait-for" button.
                 var ln=el('div','cs-tline'); ln.append(el('span',null,d.text));
-                if(d.text.indexOf('< ')===0 && d.text.indexOf('< (matched')!==0){ var u=el('button','btn cs-mini','use'); u.type='button'; u.onclick=function(){ fill(d.text.slice(2)); finished=true; closeProbe(); }; ln.append(u); }
                 lines.append(ln);
               } else if(d.type==='chunk'){ raw+=d.text; live.textContent=raw; updateTail(); }
               else if(d.type==='error'){ finished=true; out.className='tc-result fail'; head.textContent='Error: '+d.text; closeProbe(); }
               else if(d.type==='end'){ finished=true; head.textContent='Stream ended (node quiet / hold lapsed). The prompt above is what was captured — press “Use as Wait-for”, or ⤓ again.'; closeProbe(); }
             };
             // one-shot: never auto-reconnect (would re-dial). A drop before we finished is a real failure.
-            probeSrc.onerror=function(){ closeProbe(); if(!finished){ finished=true; out.className='tc-result fail'; head.textContent=(raw||lines.children.length)?'Connection lost mid-stream.':'Probe failed to start (node host unreachable or RHP link down).'; } };
+            probeSrc.onerror=function(){ closeProbe(); if(!finished){ finished=true; out.className='tc-result fail'; head.textContent=(raw||lines.children.length)?'Connection lost mid-stream.':'Couldn’t start the probe — check you’re still signed in as sysop, and the node host / RHP link is up.'; } };
           }
         })();
         </script>
