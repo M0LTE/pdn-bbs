@@ -44,7 +44,7 @@ public sealed record WebmailOptions
     /// touches NO queue). Null when no RHP link is available (a webmail-only test/standalone): the
     /// endpoint then reports a stable <c>available:false</c> rather than 404.
     /// </summary>
-    public Func<string, CancellationToken, Task<Bbs.Host.Forwarding.ConnectTestResult>>? TestConnect { get; init; }
+    public Func<string, IReadOnlyList<Bbs.Core.ConnectStep>?, CancellationToken, Task<Bbs.Host.Forwarding.ConnectTestResult>>? TestConnect { get; init; }
 
     /// <summary>
     /// The live "test to here" step-editor probe (<c>GET /forwarding/test-connect/probe</c>, an SSE
@@ -414,7 +414,22 @@ public static class Webmail
             }
 
             IFormCollection form = await ctx.Request.ReadFormAsync().ConfigureAwait(false);
-            return await TestConnect(options, call, form["partner"].ToString(), ctx.RequestAborted).ConfigureAwait(false);
+            // The editor posts its UNSAVED draft as `steps` so "Test connect" validates what's on screen,
+            // not the last-saved script; absent (or unparseable) → fall back to the stored partner's script.
+            IReadOnlyList<ConnectStep>? draft = null;
+            if (form.TryGetValue("steps", out Microsoft.Extensions.Primitives.StringValues raw) && raw.ToString().Length > 0)
+            {
+                try
+                {
+                    draft = ConnectScriptJson.Parse(raw.ToString());
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    draft = null;
+                }
+            }
+
+            return await TestConnect(options, call, form["partner"].ToString(), draft, ctx.RequestAborted).ConfigureAwait(false);
         });
 
         // The live "test to here" step-editor probe — an SSE stream (EventSource GET). Dial the UNSAVED
@@ -1005,7 +1020,7 @@ public static class Webmail
     /// SID/prompt + the dialogue transcript so the operator can validate reachability AND tighten the
     /// script's <c>EXPECT=</c> strings before un-holding forwarding at cutover. camelCase JSON.
     /// </summary>
-    private static async Task<IResult> TestConnect(WebmailOptions o, string call, string partnerCall, CancellationToken cancellationToken)
+    private static async Task<IResult> TestConnect(WebmailOptions o, string call, string partnerCall, IReadOnlyList<ConnectStep>? draftSteps, CancellationToken cancellationToken)
     {
         if (!IsSysop(o, call))
         {
@@ -1024,12 +1039,12 @@ public static class Webmail
             return Results.Json(new { error = "partner is required" }, JsonOpts, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        if (o.Store.GetPartner(partnerCall) is null)
+        if (draftSteps is null && o.Store.GetPartner(partnerCall) is null)
         {
             return Results.Json(new { error = "no such partner" }, JsonOpts, statusCode: StatusCodes.Status404NotFound);
         }
 
-        Bbs.Host.Forwarding.ConnectTestResult result = await o.TestConnect(partnerCall, cancellationToken).ConfigureAwait(false);
+        Bbs.Host.Forwarding.ConnectTestResult result = await o.TestConnect(partnerCall, draftSteps, cancellationToken).ConfigureAwait(false);
         return Results.Json(new
         {
             partner = result.Partner,
@@ -1999,9 +2014,9 @@ public static class Webmail
           if(form)form.addEventListener('submit',serialize);
           var tb=document.getElementById('cs-testbtn'), out=document.getElementById('cs-test');
           if(tb){ tb.addEventListener('click',function(){
-            closeProbe();
+            closeProbe(); serialize();
             out.hidden=false; out.className='tc-result'; out.textContent='Testing…';
-            var fd=new FormData(); fd.append('partner', ed.dataset.call);
+            var fd=new FormData(); fd.append('partner', ed.dataset.call); fd.append('steps', jsonEl.value);
             fetch(ed.dataset.test,{method:'POST',body:fd,headers:{'Accept':'application/json'}})
               .then(function(r){return r.json();}).then(function(d){render(d);})
               .catch(function(e){out.textContent='Test failed: '+e; out.className='tc-result fail';});

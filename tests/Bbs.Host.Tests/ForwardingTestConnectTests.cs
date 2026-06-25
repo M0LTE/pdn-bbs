@@ -217,6 +217,33 @@ public sealed class ForwardingTestConnectTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task TestConnect_UsesThePostedDraft_NotTheSavedScript()
+    {
+        // A partner saved with a BLANK script (post-migration) is inbound-only; the editor posts its
+        // UNSAVED draft so "Test connect" validates what's on screen, not the saved blank.
+        _host.Store.UpsertPartner(new Partner { Call = "GB7BPQ" }); // no connect script saved
+        await _host.StartLinkAsync();
+        using HttpClient client = await StartWebAsync("tom", Sysop);
+
+        Task<HttpResponseMessage> post = client.PostAsync(
+            new Uri("/forwarding/test-connect", UriKind.Relative),
+            new FormUrlEncodedContent(
+            [
+                new KeyValuePair<string, string>("partner", "GB7BPQ"),
+                new KeyValuePair<string, string>("steps", "[{\"open\":\"GB7BPQ-1\"}]"),
+            ]));
+
+        FakeRhpPeer peer = await _host.Server.NextOpenAsync();
+        Assert.Equal("GB7BPQ-1", peer.Remote);   // dialled the DRAFT's open, not "inbound-only"
+        await peer.SendLineAsync(PeerSid);
+        await peer.SendTextAsync("de GB7BPQ-1>\r");
+
+        JsonElement json = await ReadJsonAsync(await post);
+        Assert.True(json.GetProperty("ok").GetBoolean());
+        Assert.Equal("GB7BPQ-1", json.GetProperty("target").GetString());
+    }
+
+    [Fact]
     public async Task NamedStepFailure_NamesTheStepInTheError()
     {
         // wart 4: a failed cycle names the step (the step's Name threaded into the error message).

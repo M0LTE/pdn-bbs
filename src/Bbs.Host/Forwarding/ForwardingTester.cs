@@ -69,11 +69,21 @@ public sealed class ForwardingTester
     /// moved (no FBB session, no queue mutation). Throws if the partner does not exist (the caller
     /// validates existence first, so this is a guard).
     /// </summary>
-    public async Task<ConnectTestResult> TestConnectAsync(string partnerCall, CancellationToken cancellationToken)
+    public async Task<ConnectTestResult> TestConnectAsync(string partnerCall, IReadOnlyList<ConnectStep>? draftSteps, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(partnerCall);
-        Partner partner = _store.GetPartner(partnerCall)
-            ?? throw new InvalidOperationException($"No such forwarding partner \"{partnerCall}\".");
+        Partner? stored = _store.GetPartner(partnerCall);
+        if (draftSteps is null && stored is null)
+        {
+            throw new InvalidOperationException($"No such forwarding partner \"{partnerCall}\".");
+        }
+
+        // When the editor passes its UNSAVED draft, validate THAT — so "Test connect" tests the script you
+        // see in the editor, not the last-saved one (a blank saved script would otherwise read inbound-only).
+        // Otherwise validate the stored partner's script. An unsaved partner borrows the default ConTimeout.
+        Partner partner = draftSteps is null
+            ? stored!
+            : (stored ?? new Partner { Call = partnerCall }) with { ConnectScript = [.. draftSteps] };
 
         ConnectPlan plan = ConnectScript.Resolve(partner);
         IReadOnlyList<string> steps = plan.Steps.Select(RenderStep).ToList();
