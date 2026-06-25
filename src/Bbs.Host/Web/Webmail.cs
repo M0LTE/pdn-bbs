@@ -1965,18 +1965,20 @@ public static class Webmail
     /// <summary>
     /// The structured connect-script step editor (v2): a Dial block (open + optional port) over a list
     /// of expect/send step cards with an Advanced disclosure (timeout/match/ignoreCase/eol/raw/name/
-    /// expectAny), plus — when editing — a Test-connect probe whose transcript lines can be clicked
-    /// straight into a Wait-for step. The whole step list is serialised to the hidden
-    /// <c>connectScript</c> JSON field on submit (small-JS island, like the list-page test-connect).
+    /// expectAny), plus a Test-connect button (validate the whole script live) and a per-step ⤓ probe
+    /// (dial, replay the steps above, then stream the live prompt to capture a Wait-for by eye). Both work
+    /// while adding a not-yet-saved partner — they run off the draft, reading the callsign from the live
+    /// form field. The whole step list is serialised to the hidden <c>connectScript</c> JSON field on
+    /// submit (small-JS island, like the list-page test-connect).
     /// </summary>
-    private static string ConnectScriptEditor(string call, bool editing, string json, string testStreamUrl, string probeUrl)
+    private static string ConnectScriptEditor(string call, string json, string testStreamUrl, string probeUrl)
     {
-        string testButton = editing
-            ? """ <button type="button" class="btn" id="cs-testbtn">Test connect</button>"""
-            : "";
+        // The Test-connect button and the ⤓ probe run off the UNSAVED draft (the server dials the draft's
+        // open and builds a transient partner for a not-yet-saved call), so both render in add AND edit.
+        string testButton = """ <button type="button" class="btn" id="cs-testbtn">Test connect</button>""";
         return $"""
-            <div class="cs-help dim">Each step waits for text from the link, then sends a line. Type prompts exactly — a trailing space (shown below as <code>␣</code>) is significant. The Dial is the one hop we make; the steps below are typed at the remote node prompts. {(editing ? "On a step's Wait-for, <b>⤓ test to here</b> dials and replays the steps above it, then streams the node live so you can capture the prompt by eye. " : "")}Advanced fields (regex, timeout, line-ending, raw bytes, alternatives) are per step; the YAML tab has the full reference.</div>
-            <div id="cs-editor" data-script="{H(json)}" data-call="{H(call)}" data-teststream="{H(testStreamUrl)}" data-probe="{H(probeUrl)}" data-editing="{(editing ? "1" : "")}">
+            <div class="cs-help dim">Each step waits for text from the link, then sends a line. Type prompts exactly — a trailing space (shown below as <code>␣</code>) is significant. The Dial is the one hop we make; the steps below are typed at the remote node prompts. On a step's Wait-for, <b>⤓ test to here</b> dials and replays the steps above it, then streams the node live so you can capture the prompt by eye. Advanced fields (regex, timeout, line-ending, raw bytes, alternatives) are per step; the YAML tab has the full reference.</div>
+            <div id="cs-editor" data-script="{H(json)}" data-call="{H(call)}" data-teststream="{H(testStreamUrl)}" data-probe="{H(probeUrl)}">
               <div class="cs-dial"><strong>Dial</strong>
                 <input id="cs-open" placeholder="e.g. GB7RDG" autocomplete="off">
                 <label class="dim">port <input id="cs-port" class="cs-port" placeholder="any" autocomplete="off"></label>
@@ -2008,6 +2010,11 @@ public static class Webmail
           function lbl(t,ctl){var l=el('label','cs-adv-item'); l.append(el('span','dim',t),ctl); return l;}
           function sel(opts,cur){var s=el('select'); opts.forEach(function(o){var op=el('option',null,o); op.value=o; if(o===cur)op.selected=true; s.append(op);}); return s;}
           function ws(input,span){var v=input.value; if(v.length && (/^\s/.test(v)||/\s$/.test(v))){span.textContent='“'+v.replace(/ /g,'␣').replace(/\t/g,'⇥')+'”'; span.hidden=false;} else {span.hidden=true;}}
+          // The partner callsign for the test/probe partner= param: read the LIVE form field so it works
+          // when ADDING (data-call is only baked in when editing a saved partner). The server dials the
+          // draft's open step regardless and builds a transient partner for an unsaved call, so a typed
+          // callsign + a draft is all the probe needs. Falls back to data-call.
+          function partnerCall(){ var c=form&&form.querySelector('[name=call]'); var v=c?(c.value||'').trim():''; return v||(ed.dataset.call||''); }
           function renumber(){var i=1; stepsEl.querySelectorAll('.cs-step').forEach(function(r){r.querySelector('.cs-num').textContent=(i++)+'.';});}
           function makeRow(step){
             step=step||{};
@@ -2020,7 +2027,7 @@ public static class Webmail
             var dn=el('button','btn cs-mini','↓'); dn.type='button';
             var rm=el('button','btn cs-mini','✕'); rm.type='button';
             main.append(num,expect,send,up,dn,rm);
-            if(ed.dataset.editing){ var tt=el('button','btn cs-mini','⤓'); tt.type='button'; tt.title='test to here — dial, replay the steps above, then stream the prompt live'; tt.onclick=function(){probeToHere(row);}; main.append(tt); }
+            var tt=el('button','btn cs-mini','⤓'); tt.type='button'; tt.title='test to here — dial, replay the steps above, then stream the prompt live'; tt.onclick=function(){probeToHere(row);}; main.append(tt);
             var wsp=el('span','cs-ws'); wsp.hidden=true;
             expect.addEventListener('input',function(){ws(expect,wsp);}); ws(expect,wsp);
             var det=el('details','cs-adv'); det.append(el('summary',null,'Advanced'));
@@ -2068,9 +2075,11 @@ public static class Webmail
           if(tb){ tb.addEventListener('click',function(){
             closeProbe(); serialize();
             out.hidden=false; out.className='tc-result'; out.textContent='';
+            var tpc=partnerCall();
+            if(!tpc){ out.className='tc-result fail'; out.append(el('div','dim','Enter the partner callsign (the field at the top) before testing.')); return; }
             var thead=el('div','dim','Connecting & running the script…'), tlines=el('div','cs-probe-lines'), tdone=false;
             out.append(thead,tlines);
-            var tq='partner='+encodeURIComponent(ed.dataset.call)+'&steps='+encodeURIComponent(jsonEl.value);
+            var tq='partner='+encodeURIComponent(tpc)+'&steps='+encodeURIComponent(jsonEl.value);
             probeSrc=new EventSource(ed.dataset.teststream+(ed.dataset.teststream.indexOf('?')<0?'?':'&')+tq);
             probeSrc.onmessage=function(e){
               var d; try{d=JSON.parse(e.data);}catch(err){return;}
@@ -2082,7 +2091,7 @@ public static class Webmail
                 tlines.append(ln);
               } else if(d.type==='result'){ tdone=true; var r; try{r=JSON.parse(d.text);}catch(err){r={};}
                 out.className='tc-result '+(r.ok?'ok':'fail');
-                thead.textContent=(r.ok?'✓ OK':'✗ FAILED')+' — '+((r.target||ed.dataset.call)+(r.port?(' (port '+r.port+')'):''))+(r.sid?(' — SID: '+r.sid):'')+(r.error?(' — '+r.error):'');
+                thead.textContent=(r.ok?'✓ OK':'✗ FAILED')+' — '+((r.target||tpc)+(r.port?(' (port '+r.port+')'):''))+(r.sid?(' — SID: '+r.sid):'')+(r.error?(' — '+r.error):'');
                 closeProbe();
               } else if(d.type==='error'){ tdone=true; out.className='tc-result fail'; thead.textContent='Error: '+d.text; closeProbe(); }
             };
@@ -2100,8 +2109,8 @@ public static class Webmail
             return '';
           }
           function probeToHere(row){
-            if(!ed.dataset.editing) return;
             serialize();
+            var pc=partnerCall();
             // stopBefore = the index of this row among the NON-EMPTY steps serialize() actually sends.
             // Empty rows are dropped CLIENT-side by serialize(); the idx loop below uses that same
             // non-empty predicate, and Resolve drops nothing, so idx lines up 1:1 with plan.Steps.
@@ -2109,6 +2118,7 @@ public static class Webmail
             for(var j=0;j<rows.length;j++){ if(rows[j]===row) break; if(Object.keys(rows[j]._get()).length) idx++; }
             closeProbe();
             out.hidden=false; out.className='tc-result'; out.textContent='';
+            if(!pc){ out.className='tc-result fail'; out.append(el('div','dim','Enter the partner callsign (the field at the top) before testing — the probe needs it to identify the connection.')); return; }
             var head=el('div','dim','Live — dialling, then replaying the '+idx+' step(s) above. Watch the node, then press “Use as Wait-for” when the prompt has settled.');
             var lines=el('div','cs-probe-lines');
             var live=el('pre','cs-probe-raw');
@@ -2125,7 +2135,7 @@ public static class Webmail
             function fill(text){ var ex=row.querySelector('.cs-expect'); ex.value=text; ws(ex, row.querySelector('.cs-ws')); }
             useBtn.onclick=function(){ var cap=tailEl.dataset.raw||''; if(!cap){ head.textContent='Nothing captured yet — wait for the node prompt to arrive (or press ⤓ again).'; return; } finished=true; fill(cap); closeProbe(); out.className='tc-result ok'; head.textContent='Captured — Wait-for set to the highlighted prompt. Edit it if you want a shorter substring.'; };
             stopBtn.onclick=function(){ finished=true; closeProbe(); head.textContent='Stopped.'; };
-            var q='partner='+encodeURIComponent(ed.dataset.call)+'&stopBefore='+idx+'&steps='+encodeURIComponent(jsonEl.value);
+            var q='partner='+encodeURIComponent(pc)+'&stopBefore='+idx+'&steps='+encodeURIComponent(jsonEl.value);
             probeSrc=new EventSource(ed.dataset.probe+(ed.dataset.probe.indexOf('?')<0?'?':'&')+q);
             probeSrc.onmessage=function(e){
               var d; try{d=JSON.parse(e.data);}catch(err){return;}
@@ -2189,7 +2199,7 @@ public static class Webmail
             : """<input name="call" placeholder="e.g. GB7AAA" maxlength="9" required>""";
 
         string csJson = editing && partner!.ConnectScript.Count > 0 ? ConnectScriptJson.Serialize(partner.ConnectScript) : "[]";
-        string csEditor = ConnectScriptEditor(editing ? partner!.Call : "", editing, csJson, U(prefix, "/forwarding/test-connect/stream", embed), U(prefix, "/forwarding/test-connect/probe", embed));
+        string csEditor = ConnectScriptEditor(editing ? partner!.Call : "", csJson, U(prefix, "/forwarding/test-connect/stream", embed), U(prefix, "/forwarding/test-connect/probe", embed));
         string to = editing ? string.Join(" ", partner!.ToCalls) : "";
         string at = editing ? string.Join(" ", partner!.AtCalls) : "";
         string hr = editing ? string.Join(" ", partner!.HRoutes) : "";

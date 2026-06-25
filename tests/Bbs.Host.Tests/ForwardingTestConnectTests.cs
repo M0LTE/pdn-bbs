@@ -210,11 +210,110 @@ public sealed class ForwardingTestConnectTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task ProbeToHere_WorksForANeverSavedPartner_TheAddFlow()
+    {
+        // The ⤓ probe must work while ADDING a partner (before it is saved): GetPartner returns null, yet the
+        // server dials the draft's open and builds a TRANSIENT partner from the typed callsign and streams.
+        // (The editor reads that callsign from the live form field, so the button is no longer edit-only.)
+        // NB: deliberately NO UpsertPartner — "GB7NEW" is not in the store.
+        var tester = new ForwardingTester(_host.Link, _host.Store, _host.Time, NullLogger<ForwardingTester>.Instance);
+        await _host.StartLinkAsync();
+
+        ConnectStep[] draft = [new() { Open = "GB7RDG" }];
+        var events = new List<ProbeEvent>();
+        var gotPrompt = new TaskCompletionSource();
+        Task Emit(ProbeEvent ev)
+        {
+            lock (events)
+            {
+                events.Add(ev);
+            }
+
+            if (ev.Type == "chunk" && ev.Text.Contains("=>", StringComparison.Ordinal))
+            {
+                gotPrompt.TrySetResult();
+            }
+
+            return Task.CompletedTask;
+        }
+
+        using var cts = new CancellationTokenSource();
+        Task probe = tester.ProbeStreamToAsync("GB7NEW", draft, stopBefore: 0, Emit, cts.Token);
+
+        FakeRhpPeer peer = await _host.Server.NextOpenAsync();
+        Assert.Equal("GB7RDG", peer.Remote);   // dialled the DRAFT's open despite no stored partner
+        await peer.SendTextAsync("ready\r=> ");
+        await gotPrompt.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await cts.CancelAsync();
+        await probe;
+
+        Assert.Contains(events, ev => ev.Type == "chunk" && ev.Text.Contains("=>", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TestConnectStream_WorksForANeverSavedPartner_TheAddFlow()
+    {
+        // Test connect must likewise validate a partner being ADDED: with a draft and no stored row the server
+        // runs it against a transient partner rather than erroring "No such forwarding partner". NB: no Upsert.
+        var tester = new ForwardingTester(_host.Link, _host.Store, _host.Time, NullLogger<ForwardingTester>.Instance);
+        await _host.StartLinkAsync();
+
+        ConnectStep[] draft = [new() { Open = "GB7BPQ-1" }];
+        var events = new List<ProbeEvent>();
+        var done = new TaskCompletionSource();
+        Task Emit(ProbeEvent ev)
+        {
+            lock (events)
+            {
+                events.Add(ev);
+            }
+
+            if (ev.Type == "result")
+            {
+                done.TrySetResult();
+            }
+
+            return Task.CompletedTask;
+        }
+
+        Task run = tester.TestConnectStreamAsync("GB7NEW", draft, Emit, CancellationToken.None);
+
+        FakeRhpPeer peer = await _host.Server.NextOpenAsync();
+        Assert.Equal("GB7BPQ-1", peer.Remote);   // dialled the draft's open despite no stored partner
+        await peer.SendLineAsync(PeerSid);
+        await peer.SendTextAsync("de GB7BPQ-1>\r");
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await run;
+
+        ProbeEvent result = events.Last(e => e.Type == "result");
+        using JsonDocument doc = JsonDocument.Parse(result.Text);
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("GB7BPQ-1", doc.RootElement.GetProperty("target").GetString());
+    }
+
+    [Fact]
     public async Task ProbeEndpoint_NonSysop_Is403()
     {
         using HttpClient client = await StartWebAsync("nonsysop", "G7XYZ");
         HttpResponseMessage res = await client.GetAsync(new Uri("/forwarding/test-connect/probe?partner=GB7BPQ&stopBefore=0&steps=%5B%5D", UriKind.Relative));
         Assert.Equal(HttpStatusCode.Forbidden, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task AddPartnerForm_RendersTestConnectButtonAndProbeHelp_NotJustWhenEditing()
+    {
+        // The whole-script "Test connect" button and the per-step ⤓ probe must render while ADDING a partner
+        // (they run off the unsaved draft), not only when editing. The server-endpoint tests can't catch a
+        // missing button — this asserts on the rendered Add form's HTML so the render gate can't regress.
+        using HttpClient client = await StartWebAsync("tom", Sysop);
+
+        HttpResponseMessage res = await client.GetAsync(new Uri("/forwarding?add=1", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        string html = await res.Content.ReadAsStringAsync();
+
+        Assert.Contains("id=\"cs-testbtn\"", html, StringComparison.Ordinal);   // Test connect button on the Add form
+        Assert.Contains("⤓ test to here", html, StringComparison.Ordinal);      // and the help text explains the ⤓ probe
     }
 
     [Fact]
