@@ -25,9 +25,11 @@
 #              bring the CT's RF/AXUDP ports up -> GB7RDG on-air, mail STILL HELD.
 #   verify     read-only: confirm on-air health (wg==10.66.66.6, modems, live peers).
 #   connect-test the per-partner BRING-UP: forwarding is gated in TWO tiers now — the whole-BBS
-#              MASTER switch (held) AND every partner imported DISABLED. For each partner: test-connect
-#              (moves NO mail), tighten EXPECT= from the real prompt, then ENABLE it in the BBS UI.
-#              Run after network, before golive. A partner left disabled simply won't forward.
+#              MASTER switch (held) AND every partner imported DISABLED with a BLANK connect script
+#              (connect-scripts v2 retired flat-form auto-translate). For each partner: AUTHOR its
+#              structured connect script, test-connect (moves NO mail; 'Use as Wait-for' captures the
+#              real prompt), then ENABLE it. Run after network, before golive. A disabled/blank-script
+#              partner simply won't forward.
 #   golive     >>> POINT OF NO RETURN <<< hard readiness re-check (incl. >=1 partner ENABLED, else
 #              forwarding would dial no one) + typed confirm, then flip the store-backed MASTER ON +
 #              enable OARC. Mail starts moving to the enabled partners.
@@ -275,6 +277,13 @@ preflight)
   ct "test -c /dev/net/tun" && ok "CT has /dev/net/tun" || die "CT lacks /dev/net/tun — wg inherit will fail"
   ct "curl -s -m5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz" | grep -qx 200 && ok "CT node healthy" || warn "CT node /healthz not 200"
   ct "dpkg -l packetnet | tail -1 | awk '{print \\\$3}'" | grep -qE '^([1-9][0-9]*\.|0\.(2[2-9]|[3-9][0-9]))' && ok "CT node >= 0.22.0" || warn "CT node version may be below 0.22.0"
+  # connect-test AUTHORS v2 structured connect scripts (docs/connect-script-v2.md) — needs pdn-bbs >= 0.2.52.
+  bbsv="$(ct "dpkg -l pdn-bbs | tail -1 | awk '{print \\\$3}'")"
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --compare-versions "$bbsv" ge 0.2.52 && ok "CT pdn-bbs $bbsv >= 0.2.52 (connect scripts v2)" || die "CT pdn-bbs $bbsv below 0.2.52 — connect scripts v2 (structured steps) is required to author partner scripts in connect-test; install the current pdn-bbs in the CT"
+  else
+    warn "no local dpkg to version-compare; CT pdn-bbs reports $bbsv — ensure it is >= 0.2.52 (connect scripts v2)"
+  fi
   [[ -f "$TAILSCALE_KEY" ]] && ok "tailscale auth key staged (optional)" || warn "no tailscale key at $TAILSCALE_KEY — tailscale join skipped (M7TAW is dead -> non-blocking)"
   note "PREFLIGHT done. If all [ok], proceed: cutover-gb7rdg.sh freeze"
   ;;
@@ -383,20 +392,21 @@ verify)
   ;;
 
 connect-test)
-  # Run AFTER 'network' (node on-air), BEFORE 'golive'. Validates each enabled partner's connect
-  # script + lets you tighten its EXPECT= strings from the real prompt — WITHOUT moving any mail
-  # (the test-connect tool runs the script + the SID/prompt wait, then disconnects; no FBB session).
-  note "CONNECT-TEST — validate each partner, then ENABLE the good ones (on-air, forwarding still HELD)."
-  note "Two-tier gate: the whole-BBS MASTER is held AND every partner is imported DISABLED, so nothing"
-  note "moves yet. This phase is the per-partner bring-up. For EACH partner below, in the BBS sysop UI"
-  note "(Forwarding page) — or an authenticated POST to /apps/bbs/forwarding/{test-connect,partner/enable}:"
-  note "  1. click 'Test connect' — confirm ok=true + READ the transcript/prompt (moves NO mail);"
-  note "  2. multi-hop scripts (a trailing 'bbs', or a via 'C <next>') — set the partner's EXPECT="
-  note "     to the observed prompt in the forwarding editor, then re-run Test connect to confirm;"
-  note "  3. on a CLEAN connect, click 'Enable' for that partner (it stays gated until you do);"
+  # Run AFTER 'network' (node on-air), BEFORE 'golive'. You AUTHOR each partner's structured connect
+  # script (v2 steps) and test-connect it against the real prompt — WITHOUT moving any mail (the
+  # test-connect tool runs the script + the SID/prompt wait, then disconnects; no FBB session).
+  note "CONNECT-TEST — author + validate each partner, then ENABLE the good ones (on-air, forwarding still HELD)."
+  note "Two-tier gate: the whole-BBS MASTER is held AND every partner is imported DISABLED with a BLANK"
+  note "connect script (connect-scripts v2 retired flat-form auto-translate) — so nothing moves yet, and no"
+  note "partner dials until you author its script. For EACH partner, in the BBS sysop UI (Forwarding page)"
+  note "— or an authenticated POST to /apps/bbs/forwarding/{test-connect,partner/enable}:"
+  note "  1. AUTHOR its structured connect script (Forms tab): a Dial step + expect/send steps;"
+  note "  2. click 'Test connect' — it STREAMS the live dialogue (moves NO mail). 'Use as Wait-for' on the"
+  note "     observed prompt drops it (trailing space and all) into a step's expect; re-test to confirm;"
+  note "  3. on a CLEAN connect (ok=true + partner FBB SID seen), click 'Enable' (it stays gated until you do);"
   note "  4. a partner that will NOT connect — fix its script/route, or leave it DISABLED."
-  note "Direct-BBS partners need only to connect (the FBB SID-wait is the implicit expect);"
-  note "only GB7LOX ('… bbs') and GB7CIP ('C GB7WEM-7' → 'C uhf gb7cip') need real EXPECT= steps."
+  note "Direct-BBS partners are a one-step 'connect: <call>'; the multi-hop ones — GB7LOX ('… bbs' via"
+  note "GB7LOX-2) and GB7CIP ('C 3 !GB7WEM-7' -> URONode '=> ' -> 'BBS') — need the full expect/send walk."
   note "ALL partners + their current connect script + enabled state (bbs.db):"
   ct "python3 - <<'PY'
 import sqlite3
